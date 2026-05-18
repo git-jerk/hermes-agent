@@ -9584,15 +9584,65 @@ def check_respawn_guard(
     return None
 
 
-def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
-    """Return True iff there is at least one ready+assigned+unclaimed task
-    whose assignee maps to a real Hermes profile.
+def _is_claude_code_lane(assignee: Optional[str]) -> bool:
+    """Return True when ``assignee`` is configured for Claude Code --bg.
 
-    Used by the gateway- and CLI-embedded dispatchers' health telemetry to
-    decide whether ``0 spawned`` is a "stuck" condition (real spawnable
-    work waiting) or a "correctly idle" condition (only control-plane
-    lanes like ``orion-cc`` / ``orion-research`` waiting on terminals
-    that pull tasks via ``claim_task`` directly).
+    Local import keeps the kanban kernel usable without Claude Code support
+    installed and avoids a module-import cycle: ``kanban_claude_code`` imports
+    this module for DB/path helpers.
+    """
+    if not assignee:
+        return False
+    try:
+        from hermes_cli import kanban_claude_code
+
+        return kanban_claude_code.is_configured_lane(assignee)
+    except Exception:
+        return False
+
+
+def _assignee_spawnable(assignee: Optional[str], profile_exists=None) -> bool:
+    """Return True when the dispatcher has a spawn backend for assignee."""
+    if not assignee:
+        return False
+    if _is_claude_code_lane(assignee):
+        return True
+    if profile_exists is None:
+        try:
+            from hermes_cli.profiles import profile_exists as _profile_exists  # local import: avoids cycle
+        except Exception:
+            # Can't introspect — assume spawnable, preserve legacy behavior.
+            return True
+        profile_exists = _profile_exists
+    return bool(profile_exists(assignee))
+
+
+def _claude_code_spawn(
+    task: Task,
+    workspace: str,
+    *,
+    board: Optional[str] = None,
+) -> Optional[int]:
+    """Spawn a Claude Code background-session monitor for a task."""
+    from hermes_cli import kanban_claude_code
+
+    return kanban_claude_code.spawn_monitor(task, workspace, board=board)
+
+
+def _spawn_for_task(task: Task):
+    """Select the default spawn backend for a claimed task."""
+    if _is_claude_code_lane(task.assignee):
+        return _claude_code_spawn
+    return _default_spawn
+
+
+def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
+    """Return True iff ready+assigned+unclaimed work has a spawn backend.
+
+    Built-in spawn backends are Hermes profile lanes and configured external
+    lanes such as Claude Code background sessions.  Control-plane lanes that
+    are meant to be pulled manually still return False, keeping health
+    telemetry from warning on correctly-idle queues.
 
     Falls back to "any ready+assigned" if ``profile_exists`` is not
     importable (e.g. partial install) — preserves the old behavior so
@@ -9608,22 +9658,15 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     try:
         from hermes_cli.profiles import profile_exists  # local import: avoids cycle
     except Exception:
-        # Can't introspect — assume spawnable, preserve legacy behavior.
-        return True
+        profile_exists = None
     for row in rows:
-        if profile_exists(row["assignee"]):
+        if _assignee_spawnable(row["assignee"], profile_exists=profile_exists):
             return True
     return False
 
 
 def has_spawnable_review(conn: sqlite3.Connection) -> bool:
-    """Return True iff there is at least one review+assigned+unclaimed task
-    whose assignee maps to a real Hermes profile.
-
-    Mirror of :func:`has_spawnable_ready` for the review column —
-    used by the health telemetry to decide whether the dispatcher
-    should have spawned a review agent.
-    """
+    """Return True iff review+assigned+unclaimed work has a spawn backend."""
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = 'review' AND assignee IS NOT NULL "
@@ -9634,9 +9677,9 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     try:
         from hermes_cli.profiles import profile_exists  # local import: avoids cycle
     except Exception:
-        return True
+        profile_exists = None
     for row in rows:
-        if profile_exists(row["assignee"]):
+        if _assignee_spawnable(row["assignee"], profile_exists=profile_exists):
             return True
     return False
 
@@ -10219,7 +10262,7 @@ def _dispatch_once_locked(
             from hermes_cli.profiles import profile_exists  # local import: avoids cycle
         except Exception:
             profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row_assignee):
+        if not _assignee_spawnable(row["assignee"], profile_exists=profile_exists):
             # Bucket separately from skipped_unassigned: the operator
             # cannot fix this by assigning a profile (the assignee IS the
             # intended owner — a terminal lane). Health telemetry uses
@@ -10296,7 +10339,7 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+        _spawn = spawn_fn if spawn_fn is not None else _spawn_for_task(claimed)
         try:
             # Back-compat: older spawn_fn signatures accept only
             # (task, workspace). Test stubs in the suite rely on that.
@@ -10373,7 +10416,7 @@ def _dispatch_once_locked(
             from hermes_cli.profiles import profile_exists
         except Exception:
             profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row["assignee"]):
+        if not _assignee_spawnable(row["assignee"], profile_exists=profile_exists):
             result.skipped_nonspawnable.append(row["id"])
             continue
         if _per_profile_cap is not None:
@@ -10431,7 +10474,7 @@ def _dispatch_once_locked(
         claimed.skills = list(
             dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
         )
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+        _spawn = spawn_fn if spawn_fn is not None else _spawn_for_task(claimed)
         try:
             import inspect
             try:

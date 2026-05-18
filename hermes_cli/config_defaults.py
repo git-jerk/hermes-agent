@@ -2679,6 +2679,27 @@ DEFAULT_CONFIG = {
         # so stale rows don't accumulate and get scanned on every notifier
         # tick forever. Set 0 to disable the sweep.
         "done_sub_retention_days": 30,
+        # Optional live concurrency cap (already-running + newly-spawned).
+        # Set to 1 when using subscription-backed CLIs such as Claude Code
+        # background sessions to avoid parallel usage-limit spikes.
+        "max_spawn": None,
+        # Optional external lane that dispatches configured assignees through
+        # Claude Code's official background-session path (`claude --bg`) rather
+        # than Hermes provider/API calls. Disabled by default; enable and list
+        # explicit assignee names to use it.
+        "claude_code": {
+            "enabled": False,
+            "assignees": [],
+            "command": "claude",
+            "poll_interval_seconds": 60,
+            "launch_timeout_seconds": 60,
+            "unset_env": ["ANTHROPIC_API_KEY"],
+            "name_prefix": "kanban",
+            "permission_mode": None,
+            "model": None,
+            "effort": None,
+            "extra_args": [],
+        },
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.

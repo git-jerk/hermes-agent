@@ -91,13 +91,44 @@ When you create profiles for your fleet, choose names that match the *role* you 
 
 A specialisation of the profile lane: an orchestrator is a Hermes profile whose toolset includes `kanban` but excludes `terminal` / `file` / `code` / `web` for implementation. Its job is decomposing a high-level goal into child tasks via `kanban_create` + `kanban_link` and stepping back. The orchestrator skill encodes the anti-temptation rules.
 
-## Adding an external CLI worker lane
+### Claude Code background lane
 
-Wiring a non-Hermes CLI tool (Codex CLI, Claude Code CLI, OpenCode CLI, a local coding-model runner, etc.) as a kanban worker lane is *not yet a paved path*. The dispatcher's spawn function is pluggable (`spawn_fn` is a parameter on `dispatch_once`), and a plugin could register its own `spawn_fn` for a non-Hermes assignee, but the surrounding integration work — wrapping the CLI's exit code into `kanban_complete` / `kanban_block` calls, mapping the CLI's workspace/sandbox conventions onto the dispatcher's `HERMES_KANBAN_WORKSPACE` env, handling auth and per-CLI policy — is still per-integration design work.
+Hermes can dispatch explicitly configured assignees through Claude Code's official background-session path (`claude --bg`). This is useful when you want kanban automation to run under the locally logged-in Claude Code account rather than through a Hermes model provider/API-key route.
 
-If you're considering adding a CLI lane, open an issue describing the specific CLI and the workflow you're trying to enable. The contract above is the constraints any such lane must satisfy; the implementation shape (one plugin per CLI vs a generic CLI-runner plugin parameterised by config) is open.
+Enable it in config:
 
-The historical issue for this is [#19931](https://github.com/NousResearch/hermes-agent/issues/19931) and the closed-not-merged Codex-specific PR [#19924](https://github.com/NousResearch/hermes-agent/pull/19924) — those describe the original architecture proposal but didn't land a runner.
+```yaml
+kanban:
+  max_spawn: 1  # recommended for subscription-backed CLI lanes
+  claude_code:
+    enabled: true
+    assignees: [claude-code]
+    command: claude
+    poll_interval_seconds: 60
+    unset_env: [ANTHROPIC_API_KEY]
+    # Optional: permission_mode, model, effort, extra_args
+```
+
+Then assign cards to that lane:
+
+```bash
+hermes kanban assign <task_id> claude-code
+```
+
+The dispatcher spawns a lightweight monitor process. The monitor launches `claude --bg`, records the `task_id → claude_session_id` mapping in `claude_code_sessions.jsonl`, mirrors `claude logs <session>` snapshots into the normal worker log, and heartbeats the kanban claim while the Claude Code session works. The Claude Code prompt tells the session to inspect the card with `hermes kanban show` and end with either `hermes kanban complete` or `hermes kanban block`.
+
+Guardrails:
+
+- The runner strips `ANTHROPIC_API_KEY` by default before launching Claude Code.
+- The runner forbids `-p` / `--print` / `--bare` extra args, because those routes bypass the intended interactive/background auth path.
+- Keep `kanban.max_spawn: 1` unless you intentionally want parallel Claude Code background sessions.
+- If Claude Code exits without completing or blocking the card, normal kanban recovery still applies: max-runtime, manual reclaim, and the failure circuit breaker surface the stuck run.
+
+## Adding another external CLI worker lane
+
+Wiring other non-Hermes CLI tools (Codex CLI, OpenCode CLI, a local coding-model runner, etc.) uses the same lane contract, but each CLI still needs its own adapter for auth, sandbox/workspace rules, logging, and lifecycle termination. The dispatcher's spawn function remains pluggable (`spawn_fn` is a parameter on `dispatch_once`), and the Claude Code lane is the reference shape for adding a built-in adapter.
+
+The historical issue for this is [#19931](https://github.com/NousResearch/hermes-agent/issues/19931) and the closed-not-merged Codex-specific PR [#19924](https://github.com/NousResearch/hermes-agent/pull/19924) — those describe the original architecture proposal.
 
 ## Failure modes the dispatcher handles
 
