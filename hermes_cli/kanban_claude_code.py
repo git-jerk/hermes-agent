@@ -42,6 +42,39 @@ DEFAULT_CLAUDE_CODE_CONFIG: dict[str, Any] = {
 }
 
 _FORBIDDEN_BG_ARGS = {"-p", "--print", "--bare"}
+_AUTH_PRODUCT_RE = re.compile(r"\b(?:claude(?:\s+code)?|anthropic)\b", re.IGNORECASE)
+_AUTH_CONTEXT_RE = re.compile(
+    r"\b(?:auth(?:entication)?|account|credential|oauth|token|subscription)\b",
+    re.IGNORECASE,
+)
+_EXPLICIT_AUTH_FAILURE_RE = re.compile(
+    r"\b(?:auth(?:entication)?\s+(?:failed|required)|needs\s+auth(?:entication)?|"
+    r"please\s+(?:run\s+)?/login|run\s+/login|"
+    r"please\s+(?:log|sign)\s+in)\b",
+    re.IGNORECASE,
+)
+_AUTH_FAILURE_RE = re.compile(
+    r"(?:\b(?:401|unauthori[sz]ed|not\s+logged\s+in)\b|"
+    + _EXPLICIT_AUTH_FAILURE_RE.pattern
+    + r")",
+    re.IGNORECASE,
+)
+_STANDALONE_LOGIN_PROMPT_RE = re.compile(
+    r"^\s*(?:(?:please\s+)?run\s+)?/login(?:\s+first)?\s*[.!:]?\s*$",
+    re.IGNORECASE,
+)
+_BENIGN_TEST_CONTEXT_RE = re.compile(
+    r"\b(?:pytest|expects?|expecting|expected|mock|fixture|test\s+server|sdk|client|proxy)\b",
+    re.IGNORECASE,
+)
+_BENIGN_HTTP_ROUTE_CONTEXT_RE = re.compile(
+    r"\b(?:GET|POST|PUT|PATCH|DELETE|route|endpoint|demo\s+app|dashboard)\b",
+    re.IGNORECASE,
+)
+_SECRETISH_LOG_VALUE_RE = re.compile(
+    r"\b(api[_-]?key|token|credential|secret|password)\b\s*[:=]\s*[^\s,;]+",
+    re.IGNORECASE,
+)
 _SESSION_ID_RE = re.compile(r"\bbackgrounded\s+[·•:\-]\s*([A-Za-z0-9_-]+)\b")
 _ATTACH_ID_RE = re.compile(r"\bclaude\s+attach\s+([A-Za-z0-9_-]+)\b")
 
@@ -112,6 +145,80 @@ def parse_claude_bg_session_id(output: str) -> str:
     return match.group(1)
 
 
+def _sanitize_auth_failure_excerpt(excerpt: str) -> str:
+    """Keep auth-failure summaries short and avoid persisting token-shaped text."""
+    compact = " ".join((excerpt or "").split())
+    compact = _SECRETISH_LOG_VALUE_RE.sub(
+        lambda match: f"{match.group(1)}=[redacted]",
+        compact,
+    )
+    if len(compact) > 160:
+        compact = compact[:157] + "..."
+    return compact
+
+
+def _is_benign_auth_failure_line(line: str) -> bool:
+    """Return True for app/test 401/login mentions that should not block a task."""
+    if _EXPLICIT_AUTH_FAILURE_RE.search(line) or _STANDALONE_LOGIN_PROMPT_RE.search(line):
+        return False
+    if _BENIGN_TEST_CONTEXT_RE.search(line):
+        return True
+    return bool(_BENIGN_HTTP_ROUTE_CONTEXT_RE.search(line) and not _AUTH_CONTEXT_RE.search(line))
+
+
+def _line_has_claude_auth_failure(line: str) -> bool:
+    """Return True when a single log line is a Claude/Anthropic auth failure."""
+    if _STANDALONE_LOGIN_PROMPT_RE.search(line):
+        return True
+    if not (_AUTH_PRODUCT_RE.search(line) and _AUTH_FAILURE_RE.search(line)):
+        return False
+    return not _is_benign_auth_failure_line(line)
+
+
+def _window_has_claude_auth_failure(lines: Sequence[str]) -> bool:
+    """Return True when adjacent lines jointly identify Claude auth failure."""
+    window = " ".join(lines)
+    if not (_AUTH_PRODUCT_RE.search(window) and _AUTH_FAILURE_RE.search(window)):
+        return False
+    failure_lines = [line for line in lines if _AUTH_FAILURE_RE.search(line)]
+    return any(not _is_benign_auth_failure_line(line) for line in failure_lines)
+
+
+def detect_claude_auth_failure(output: str) -> Optional[str]:
+    """Return a concise reason when ``claude logs`` shows auth failure.
+
+    A background session id only proves that Claude Code accepted the launch.
+    If the background daemon later renders auth-context ``/login`` or ``401``
+    messages in its own logs, the worker cannot make progress and the kanban
+    card should be blocked instead of emitting healthy heartbeats forever.
+    """
+    lines = [line.strip() for line in (output or "").splitlines() if line.strip()]
+    for idx, line in enumerate(lines):
+        if _line_has_claude_auth_failure(line):
+            matched = _sanitize_auth_failure_excerpt(line)
+            return f"Claude Code background auth failure detected in logs: {matched}"
+
+        # Claude logs sometimes split the product/auth context and the concrete
+        # failure across adjacent lines. Check a small local window instead of
+        # the whole output so app/test output elsewhere cannot poison the match.
+        start = max(0, idx - 1)
+        end = min(len(lines), idx + 2)
+        window_lines = lines[start:end]
+        if _window_has_claude_auth_failure(window_lines):
+            matched = _sanitize_auth_failure_excerpt(" ".join(window_lines))
+            return f"Claude Code background auth failure detected in logs: {matched}"
+    return None
+
+
+def _reject_forbidden_bg_args(parts: Sequence[str]) -> None:
+    forbidden = [arg for arg in parts if arg in _FORBIDDEN_BG_ARGS]
+    if forbidden:
+        raise ValueError(
+            "Claude Code kanban lane forbids print/bare mode arguments: "
+            + ", ".join(sorted(set(forbidden)))
+        )
+
+
 def _command_parts(command: Any) -> list[str]:
     if isinstance(command, (list, tuple)):
         parts = [str(p) for p in command if str(p)]
@@ -154,7 +261,11 @@ def build_claude_bg_argv(
     extra_args: Optional[Sequence[str]] = None,
 ) -> list[str]:
     """Build a safe official Claude Code background-session argv."""
-    argv = [*_command_parts(command), "--bg"]
+    command_parts = _command_parts(command)
+    extras = _as_list(extra_args)
+    _reject_forbidden_bg_args([*command_parts, *extras])
+
+    argv = [*command_parts, "--bg"]
     if name:
         argv.extend(["--name", str(name)])
     if permission_mode:
@@ -164,13 +275,6 @@ def build_claude_bg_argv(
     if effort:
         argv.extend(["--effort", str(effort)])
 
-    extras = _as_list(extra_args)
-    forbidden = [arg for arg in extras if arg in _FORBIDDEN_BG_ARGS]
-    if forbidden:
-        raise ValueError(
-            "Claude Code kanban lane forbids print/bare mode arguments: "
-            + ", ".join(sorted(set(forbidden)))
-        )
     argv.extend(extras)
     argv.append(prompt)
     return argv
@@ -195,11 +299,12 @@ Kanban context:
 Required workflow:
 1. First inspect the card with `hermes kanban --board {board_slug} show {task.id} --json`.
 2. Work only inside the task workspace unless the card explicitly authorizes a broader path.
-3. For long work, leave progress with `hermes kanban --board {board_slug} comment {task.id} "..."`.
-4. End this run with exactly one terminal Kanban transition:
+3. Treat the Kanban context above as authoritative. Claude Code background daemons can reuse shell environment from an earlier background session; do not rely on `$HERMES_KANBAN_TASK`, `$HERMES_KANBAN_BOARD`, or `$HERMES_KANBAN_WORKSPACE` unless they exactly match the Task id / Board / Workspace shown above. Prefer literal task ids in Kanban commands.
+4. For long work, leave progress with `hermes kanban --board {board_slug} comment {task.id} "..."`.
+5. End this run with exactly one terminal Kanban transition:
    - success: `hermes kanban --board {board_slug} complete {task.id} --summary "..." --metadata '{{"changed_files": [], "tests": []}}'`
    - needs human input/review: `hermes kanban --board {board_slug} block {task.id} "review-required: ..."`
-5. Do not finish the Claude Code session while the task remains `running`; block it if you cannot complete it safely.
+6. Do not finish the Claude Code session while the task remains `running`; block it if you cannot complete it safely.
 """
 
 
@@ -443,6 +548,41 @@ def monitor_task(
                             f.write(b"\n")
                 except OSError:
                     pass
+                auth_failure = detect_claude_auth_failure(logs.stdout)
+                if auth_failure:
+                    reason = f"review-required: {auth_failure}"
+                    current: Optional[kb.Task] = None
+                    with contextlib.closing(kb.connect(board=board)) as conn:
+                        blocked = kb.block_task(
+                            conn,
+                            task_id,
+                            reason=reason,
+                            expected_run_id=expected_run_id,
+                        )
+                        if not blocked:
+                            current = kb.get_task(conn, task_id)
+                    if blocked:
+                        print(
+                            f"kanban claude-code monitor: blocked {task_id}: {auth_failure}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        return 1
+                    if (
+                        current is None
+                        or current.status != "running"
+                        or (
+                            expected_run_id is not None
+                            and current.current_run_id != expected_run_id
+                        )
+                    ):
+                        return 0
+                    print(
+                        f"kanban claude-code monitor: auth failure seen but could not block {task_id}: {auth_failure}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    return 1
         except Exception as exc:
             print(f"kanban claude-code monitor: logs poll failed: {exc}", file=sys.stderr, flush=True)
 
