@@ -184,6 +184,105 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
             )
 
 
+_PREFLIGHT_COMPRESSION_MAX_PASSES = 3
+
+
+def _reset_after_preflight_compression(agent) -> None:
+    """Reset retry/mute state after preflight compression creates a new context.
+
+    Compression has logically given the model a fresh request payload. Retry
+    counters from the oversized pre-compression context should not carry over
+    and cause an immediate empty-response/tool-loop abort.
+    """
+    agent._empty_content_retries = 0
+    agent._thinking_prefill_retries = 0
+    agent._last_content_with_tools = None
+    agent._last_content_tools_all_housekeeping = False
+    agent._mute_post_response = False
+
+
+def _maybe_run_preflight_compression(
+    agent,
+    messages: List[Dict[str, Any]],
+    system_message: str,
+    active_system_prompt: str,
+    effective_task_id: str,
+    conversation_history: Optional[List[Dict[str, Any]]],
+) -> tuple[List[Dict[str, Any]], str, Optional[List[Dict[str, Any]]]]:
+    """Compress an already-large loaded conversation before the LLM call.
+
+    The gateway path commonly constructs a fresh ``AIAgent`` for each inbound
+    message, so repeated preflight checks are the safety valve before a large
+    Matrix session hits the provider. After each compaction pass we must
+    re-estimate the *post-compression* request size (including tools) and stop
+    as soon as the request falls below threshold. If compression remains near
+    the threshold, cap the loop so a bad compaction policy cannot stall every
+    turn indefinitely.
+    """
+    if not (
+        agent.compression_enabled
+        and len(messages) > agent.context_compressor.protect_first_n
+                            + agent.context_compressor.protect_last_n + 1
+    ):
+        return messages, active_system_prompt, conversation_history
+
+    # Include tool schema tokens — with many tools these can add 20-30K+
+    # tokens that a system+message estimate misses entirely.
+    preflight_tokens = estimate_request_tokens_rough(
+        messages,
+        system_prompt=active_system_prompt or "",
+        tools=agent.tools or None,
+    )
+
+    if preflight_tokens < agent.context_compressor.threshold_tokens:
+        return messages, active_system_prompt, conversation_history
+
+    logger.info(
+        "Preflight compression: ~%s tokens >= %s threshold (model %s, ctx %s)",
+        f"{preflight_tokens:,}",
+        f"{agent.context_compressor.threshold_tokens:,}",
+        agent.model,
+        f"{agent.context_compressor.context_length:,}",
+    )
+    agent._emit_status(
+        f"📦 Preflight compression: ~{preflight_tokens:,} tokens "
+        f">= {agent.context_compressor.threshold_tokens:,} threshold. "
+        "This may take a moment."
+    )
+
+    # May need multiple passes for very large sessions with small context
+    # windows (each pass summarises the middle N turns), but the loop is
+    # intentionally bounded so a session that remains near threshold cannot
+    # preflight-compact forever.
+    for _pass in range(_PREFLIGHT_COMPRESSION_MAX_PASSES):
+        orig_len = len(messages)
+        messages, active_system_prompt = agent._compress_context(
+            messages, system_message, approx_tokens=preflight_tokens,
+            task_id=effective_task_id,
+        )
+        if len(messages) >= orig_len:
+            break  # Cannot compress further
+
+        # Compression created a new session — clear the history reference so
+        # _flush_messages_to_session_db writes ALL compressed messages to the
+        # new session's SQLite, not skipping them because conversation_history
+        # is still the pre-compression length.
+        conversation_history = None
+        _reset_after_preflight_compression(agent)
+
+        # Verify the post-compression request size (including tool schemas)
+        # before deciding whether a second pass is warranted.
+        preflight_tokens = estimate_request_tokens_rough(
+            messages,
+            system_prompt=active_system_prompt or "",
+            tools=agent.tools or None,
+        )
+        if preflight_tokens < agent.context_compressor.threshold_tokens:
+            break  # Under threshold
+
+    return messages, active_system_prompt, conversation_history
+
+
 def run_conversation(
     agent,
     user_message: str,
@@ -420,72 +519,20 @@ def run_conversation(
     active_system_prompt = agent._cached_system_prompt
 
     # ── Preflight context compression ──
-    # Before entering the main loop, check if the loaded conversation
-    # history already exceeds the model's context threshold.  This handles
-    # cases where a user switches to a model with a smaller context window
-    # while having a large existing session — compress proactively rather
-    # than waiting for an API error (which might be caught as a non-retryable
-    # 4xx and abort the request entirely).
-    if (
-        agent.compression_enabled
-        and len(messages) > agent.context_compressor.protect_first_n
-                            + agent.context_compressor.protect_last_n + 1
-    ):
-        # Include tool schema tokens — with many tools these can add
-        # 20-30K+ tokens that the old sys+msg estimate missed entirely.
-        _preflight_tokens = estimate_request_tokens_rough(
-            messages,
-            system_prompt=active_system_prompt or "",
-            tools=agent.tools or None,
-        )
-
-        if _preflight_tokens >= agent.context_compressor.threshold_tokens:
-            logger.info(
-                "Preflight compression: ~%s tokens >= %s threshold (model %s, ctx %s)",
-                f"{_preflight_tokens:,}",
-                f"{agent.context_compressor.threshold_tokens:,}",
-                agent.model,
-                f"{agent.context_compressor.context_length:,}",
-            )
-            agent._emit_status(
-                f"📦 Preflight compression: ~{_preflight_tokens:,} tokens "
-                f">= {agent.context_compressor.threshold_tokens:,} threshold. "
-                "This may take a moment."
-            )
-            # May need multiple passes for very large sessions with small
-            # context windows (each pass summarises the middle N turns).
-            for _pass in range(3):
-                _orig_len = len(messages)
-                messages, active_system_prompt = agent._compress_context(
-                    messages, system_message, approx_tokens=_preflight_tokens,
-                    task_id=effective_task_id,
-                )
-                if len(messages) >= _orig_len:
-                    break  # Cannot compress further
-                # Compression created a new session — clear the history
-                # reference so _flush_messages_to_session_db writes ALL
-                # compressed messages to the new session's SQLite, not
-                # skipping them because conversation_history is still the
-                # pre-compression length.
-                conversation_history = None
-                # Fix: reset retry counters after compression so the model
-                # gets a fresh budget on the compressed context.  Without
-                # this, pre-compression retries carry over and the model
-                # hits "(empty)" immediately after compression-induced
-                # context loss.
-                agent._empty_content_retries = 0
-                agent._thinking_prefill_retries = 0
-                agent._last_content_with_tools = None
-                agent._last_content_tools_all_housekeeping = False
-                agent._mute_post_response = False
-                # Re-estimate after compression
-                _preflight_tokens = estimate_request_tokens_rough(
-                    messages,
-                    system_prompt=active_system_prompt or "",
-                    tools=agent.tools or None,
-                )
-                if _preflight_tokens < agent.context_compressor.threshold_tokens:
-                    break  # Under threshold
+    # Before entering the main loop, check if the loaded conversation history
+    # already exceeds the model's context threshold.  This handles cases where a
+    # user switches to a model with a smaller context window while having a large
+    # existing session — compress proactively rather than waiting for an API
+    # error (which might be caught as a non-retryable 4xx and abort the request
+    # entirely).
+    messages, active_system_prompt, conversation_history = _maybe_run_preflight_compression(
+        agent,
+        messages,
+        system_message,
+        active_system_prompt,
+        effective_task_id,
+        conversation_history,
+    )
 
     # Plugin hook: pre_llm_call
     # Fired once per turn before the tool-calling loop.  Plugins can
