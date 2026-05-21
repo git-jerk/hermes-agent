@@ -285,13 +285,46 @@ def test_recompute_ready_promotes_blocked_with_done_parents(kanban_home):
         )
         conn.commit()
         assert kb.get_task(conn, child).status == "blocked"
-        # recompute_ready should promote blocked → ready and reset failures
+        # recompute_ready should promote blocked → ready. Local fork-patch:
+        # the failure counter is preserved across auto-promotion (cleared
+        # only by a successful completion) so the breaker can still
+        # re-trip if the promoted run fails again.
         promoted = kb.recompute_ready(conn)
         assert promoted == 1
         task = kb.get_task(conn, child)
         assert task.status == "ready"
-        assert task.consecutive_failures == 0
-        assert task.last_failure_error is None
+        assert task.consecutive_failures == 5
+        assert task.last_failure_error == "persistent error"
+
+
+def test_recompute_ready_caps_circuit_breaker_recovery(kanban_home):
+    """Circuit-breaker (`gave_up`) blocks auto-recover at most once.
+
+    Local fork-patch: the first `gave_up` may be transient so
+    recompute_ready promotes it once; a second `gave_up` means a
+    deterministic failure (e.g. a protocol violation) and the task must
+    stay blocked for an explicit human unblock instead of crash-looping.
+    """
+    with kb.connect() as conn:
+        once = kb.create_task(conn, title="one-trip", assignee="a")
+        twice = kb.create_task(conn, title="two-trips", assignee="a")
+        now = int(time.time())
+        with kb.write_txn(conn):
+            for tid, trips in ((once, 1), (twice, 2)):
+                conn.execute(
+                    "UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,)
+                )
+                for _ in range(trips):
+                    conn.execute(
+                        "INSERT INTO task_events (task_id, kind, created_at) "
+                        "VALUES (?, 'gave_up', ?)",
+                        (tid, now),
+                    )
+        kb.recompute_ready(conn)
+        # One trip → still eligible for its single auto-recovery.
+        assert kb.get_task(conn, once).status == "ready"
+        # Two trips → deterministic failure; stays blocked for a human.
+        assert kb.get_task(conn, twice).status == "blocked"
 
 
 def test_recompute_ready_fan_in_waits_for_all_parents(kanban_home):
@@ -681,8 +714,14 @@ def test_block_then_unblock(kanban_home):
         assert kb.get_task(conn, t).status == "ready"
 
 
-def test_unblock_resets_failure_counters(kanban_home):
-    """unblock_task must reset consecutive_failures and last_failure_error."""
+def test_unblock_preserves_failure_counters(kanban_home):
+    """unblock_task must PRESERVE consecutive_failures / last_failure_error.
+
+    Local fork-patch: zeroing the breaker counter on every unblock handed
+    a crash-looping task a fresh retry budget each cycle, so the circuit
+    breaker never stuck. An unblock buys exactly one more run; only a
+    successful completion legitimately clears the counter.
+    """
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="a")
         kb.claim_task(conn, t)
@@ -697,8 +736,8 @@ def test_unblock_resets_failure_counters(kanban_home):
         assert kb.unblock_task(conn, t)
         task = kb.get_task(conn, t)
         assert task.status == "ready"
-        assert task.consecutive_failures == 0
-        assert task.last_failure_error is None
+        assert task.consecutive_failures == 5
+        assert task.last_failure_error == "test error"
 
 
 # ---------------------------------------------------------------------------
@@ -2814,6 +2853,14 @@ def test_detect_stale_returns_running_task_with_no_heartbeat(kanban_home, monkey
                 "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
                 (five_hours_ago, t),
             )
+            # Back-date lifecycle events too: a task genuinely running 5h
+            # has 5h-old events. detect_stale_running now treats recent
+            # task activity as a liveness signal, so the fixture must be
+            # internally consistent (local fork-patch).
+            conn.execute(
+                "UPDATE task_events SET created_at = ? WHERE task_id = ?",
+                (five_hours_ago, t),
+            )
         # No heartbeat set — last_heartbeat_at stays NULL.
 
         monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
@@ -2848,6 +2895,14 @@ def test_detect_stale_returns_task_with_stale_heartbeat(kanban_home, monkeypatch
                 "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
                 (five_hours_ago, t),
             )
+            # Back-date lifecycle events for fixture consistency: recent
+            # task activity counts as liveness (local fork-patch). With
+            # events 5h old and the heartbeat 2h old, the freshest signal
+            # is the 2h-old heartbeat — still past the 1h stale gap.
+            conn.execute(
+                "UPDATE task_events SET created_at = ? WHERE task_id = ?",
+                (five_hours_ago, t),
+            )
 
         monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
         stale = kb.detect_stale_running(
@@ -2857,6 +2912,53 @@ def test_detect_stale_returns_task_with_stale_heartbeat(kanban_home, monkeypatch
             "Task with heartbeat >1h old and started >4h ago should be stale"
         )
         assert kb.get_task(conn, t).status == "ready"
+
+
+def test_detect_stale_skips_task_with_recent_activity(kanban_home, monkeypatch):
+    """A long-running task with NO heartbeat but recent task activity is
+    NOT reclaimed.
+
+    Local fork-patch: last_heartbeat_at is worker-discretionary; a worker
+    still appending task_events (comments, sub-task creates) is
+    demonstrably alive, so recent event activity counts as a liveness
+    signal alongside the explicit heartbeat.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="busy-no-hb", assignee="worker")
+        kb.claim_task(conn, t)
+        kb._set_worker_pid(conn, t, os.getpid())
+
+        five_hours_ago = int(time.time()) - (5 * 3600)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET started_at = ? WHERE id = ?", (five_hours_ago, t)
+            )
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? "
+                "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                (five_hours_ago, t),
+            )
+            # Lifecycle events are old ...
+            conn.execute(
+                "UPDATE task_events SET created_at = ? WHERE task_id = ?",
+                (five_hours_ago, t),
+            )
+            # ... but the worker appended a comment a minute ago.
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, created_at) "
+                "VALUES (?, 'commented', ?)",
+                (t, int(time.time()) - 60),
+            )
+        # No heartbeat ever — last_heartbeat_at stays NULL.
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
+        stale = kb.detect_stale_running(
+            conn, stale_timeout_seconds=14400, signal_fn=lambda p, s: None,
+        )
+        assert t not in stale, "Task with recent activity must not be reclaimed"
+        assert kb.get_task(conn, t).status == "running"
 
 
 def test_detect_stale_skips_task_with_recent_heartbeat(kanban_home, monkeypatch):
@@ -3002,6 +3104,13 @@ def test_detect_stale_does_not_tick_failure_counter(kanban_home, monkeypatch):
             conn.execute(
                 "UPDATE task_runs SET started_at = ? "
                 "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                (five_hours_ago, t),
+            )
+            # Back-date lifecycle events for fixture consistency:
+            # detect_stale_running treats recent task activity as a
+            # liveness signal (local fork-patch).
+            conn.execute(
+                "UPDATE task_events SET created_at = ? WHERE task_id = ?",
                 (five_hours_ago, t),
             )
             # Counter starts at 0; assert that's our baseline.

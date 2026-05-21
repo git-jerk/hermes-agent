@@ -2136,12 +2136,29 @@ def recompute_ready(conn: sqlite3.Connection) -> int:
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
-            if cur_status == "blocked" and _has_sticky_block(conn, task_id):
-                # Worker / operator asked for human review — do not
-                # silently auto-recover.  ``unblock_task`` is the only
-                # legitimate exit (it emits ``"unblocked"`` which flips
-                # this predicate back).
-                continue
+            if cur_status == "blocked":
+                if _has_sticky_block(conn, task_id):
+                    # Worker / operator asked for human review — do not
+                    # silently auto-recover.  ``unblock_task`` is the only
+                    # legitimate exit (it emits ``"unblocked"`` which flips
+                    # this predicate back).
+                    continue
+                # NOTE (local fork-patch): a circuit-breaker (`gave_up`)
+                # block auto-recovers at most ONCE. The first trip may be
+                # transient (infra blip, parent not yet done). A second
+                # `gave_up` means the failure is deterministic — e.g. a
+                # protocol violation (worker exits rc=0 without a terminal
+                # transition), which every respawn repeats verbatim.
+                # Without this cap recompute_ready re-promotes the task
+                # every tick and it crash-loops forever; leave it blocked
+                # for an explicit human `kanban unblock` instead.
+                gave_up_count = conn.execute(
+                    "SELECT COUNT(*) AS c FROM task_events "
+                    "WHERE task_id = ? AND kind = 'gave_up'",
+                    (task_id,),
+                ).fetchone()["c"]
+                if gave_up_count >= 2:
+                    continue
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
@@ -2149,13 +2166,14 @@ def recompute_ready(conn: sqlite3.Connection) -> int:
                 (task_id,),
             ).fetchall()
             if all(p["status"] in ("done", "archived") for p in parents):
-                # Blocked tasks also get their failure counters reset —
-                # this is effectively an auto-unblock (circuit-breaker
-                # recovery; worker-initiated blocks are skipped above).
+                # NOTE (local fork-patch): the failure counter is no
+                # longer zeroed on auto-promotion. Preserving it lets the
+                # breaker re-trip immediately if the one allowed
+                # auto-recovery run fails again, instead of handing the
+                # task a fresh retry budget each cycle.
                 if cur_status == "blocked":
                     conn.execute(
-                        "UPDATE tasks SET status = 'ready', "
-                        "consecutive_failures = 0, last_failure_error = NULL "
+                        "UPDATE tasks SET status = 'ready' "
                         "WHERE id = ? AND status = 'blocked'",
                         (task_id,),
                     )
@@ -3144,9 +3162,15 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             (task_id,),
         ).fetchone()
         new_status = "todo" if undone_parents else "ready"
+        # NOTE (local fork-patch): do NOT reset consecutive_failures /
+        # last_failure_error here. Zeroing the breaker counter on every
+        # unblock handed a crash-looping task a full fresh retry budget
+        # each time it was unblocked (by an operator OR a watchdog), so
+        # the circuit breaker never stuck. Preserving the counter means
+        # an unblock buys exactly one more run; a successful completion
+        # is what legitimately clears it.
         cur = conn.execute(
-            "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
+            "UPDATE tasks SET status = ?, current_run_id = NULL "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (new_status, task_id),
         )
@@ -4640,7 +4664,9 @@ def detect_stale_running(
 
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
-        "       COALESCE(r.started_at, t.started_at) AS active_started_at "
+        "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
+        "       (SELECT MAX(e.created_at) FROM task_events e "
+        "        WHERE e.task_id = t.id) AS last_event_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
         "WHERE t.status = 'running'"
@@ -4655,10 +4681,21 @@ def detect_stale_running(
         if elapsed < stale_timeout_seconds:
             continue  # not old enough to check
 
+        # NOTE (local fork-patch): treat *either* an explicit heartbeat
+        # or any recent task_event as a liveness signal. last_heartbeat_at
+        # only moves when the worker calls the discretionary
+        # ``kanban_heartbeat`` tool, which LLM workers routinely skip — so
+        # keying staleness off it alone false-reclaims healthy runs that
+        # legitimately exceed stale_timeout_seconds. A worker still
+        # appending events (comments, sub-task creates, heartbeats) is
+        # demonstrably alive.
         last_hb = row["last_heartbeat_at"]
         hb_age = (now - int(last_hb)) if last_hb is not None else None
-        if hb_age is not None and hb_age < _STALE_HEARTBEAT_GAP_SECONDS:
-            continue  # recent heartbeat → still alive
+        _signals = [s for s in (last_hb, row["last_event_at"]) if s is not None]
+        last_signal = max(_signals) if _signals else None
+        signal_age = (now - int(last_signal)) if last_signal is not None else None
+        if signal_age is not None and signal_age < _STALE_HEARTBEAT_GAP_SECONDS:
+            continue  # recent heartbeat or task activity → still alive
 
         pid = row["worker_pid"]
         tid = row["id"]
