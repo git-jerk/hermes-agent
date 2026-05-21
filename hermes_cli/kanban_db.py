@@ -71,10 +71,12 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+import copy
 import json
 import os
 import re
 import secrets
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -427,6 +429,20 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
     return meta
 
 
+def _board_metadata_defaults_from_config() -> dict[str, Any]:
+    """Return metadata defaults copied into newly written board.json files.
+
+    ``kanban.board_defaults`` is the operator-facing place for policy that
+    should appear on every new board (for example routing_policy).  Existing
+    explicit board metadata wins; defaults only fill missing keys.
+    """
+    cfg = _load_kanban_cfg()
+    defaults = cfg.get("board_defaults") if isinstance(cfg, dict) else None
+    if not isinstance(defaults, dict):
+        return {}
+    return {str(k): copy.deepcopy(v) for k, v in defaults.items()}
+
+
 def write_board_metadata(
     board: Optional[str],
     *,
@@ -447,6 +463,10 @@ def write_board_metadata(
     # Preserve existing DB-derived fields — they get re-computed each
     # read but shouldn't be written into board.json.
     meta.pop("db_path", None)
+    defaults = _board_metadata_defaults_from_config()
+    for key, value in defaults.items():
+        if key not in meta:
+            meta[key] = copy.deepcopy(value)
     if name is not None:
         meta["name"] = str(name).strip() or _default_board_display_name(slug)
     if description is not None:
@@ -3139,6 +3159,511 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return True
 
 
+_REVIEW_REQUIRED_PREFIX_RE = re.compile(r"^\s*review[-_ ]required\s*:", re.IGNORECASE)
+_FIX_CARD_HANDOFF_RE = re.compile(r"^\s*fix[-_ ]card[-_ ]created\b\s*:?,?", re.IGNORECASE)
+
+
+def _truthy_config_value(value: Any) -> bool:
+    """Interpret loose YAML/JSON/string booleans used in board metadata."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on", "y"}
+    return False
+
+
+def _load_kanban_cfg() -> dict:
+    try:
+        from hermes_cli.config import load_config  # local import avoids cycles
+        cfg = load_config() or {}
+    except Exception:
+        return {}
+    return cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+
+
+def _configured_claude_code_assignees(kanban_cfg: Optional[dict] = None) -> set[str]:
+    """Return assignee names backed by the configured Claude Code lane.
+
+    These assignees are intentionally not Hermes profiles on disk, so plain
+    ``profile_exists()`` would mark them non-spawnable even when the operator
+    configured ``kanban.claude_code`` to launch them.
+    """
+    cfg = kanban_cfg if kanban_cfg is not None else _load_kanban_cfg()
+    cc_cfg = cfg.get("claude_code") if isinstance(cfg, dict) else None
+    if not isinstance(cc_cfg, dict) or not _truthy_config_value(cc_cfg.get("enabled")):
+        return set()
+    raw = cc_cfg.get("assignees") or []
+    if isinstance(raw, str):
+        items = [part.strip() for part in raw.split(",")]
+    elif isinstance(raw, Iterable):
+        items = [str(part).strip() for part in raw]
+    else:
+        items = []
+    return {item for item in items if item}
+
+
+def _is_configured_claude_code_assignee(assignee: Any, kanban_cfg: Optional[dict] = None) -> bool:
+    return bool(str(assignee or "").strip() in _configured_claude_code_assignees(kanban_cfg))
+
+
+def _claude_code_config_for_assignee(
+    assignee: Any,
+    kanban_cfg: Optional[dict] = None,
+) -> Optional[dict[str, Any]]:
+    """Return Claude Code lane config when ``assignee`` is globally enabled."""
+    name = str(assignee or "").strip()
+    if not name:
+        return None
+    cfg = kanban_cfg if kanban_cfg is not None else _load_kanban_cfg()
+    cc_cfg = cfg.get("claude_code") if isinstance(cfg, dict) else None
+    if not isinstance(cc_cfg, dict) or not _truthy_config_value(cc_cfg.get("enabled")):
+        return None
+    if name not in _configured_claude_code_assignees(cfg):
+        return None
+    return cc_cfg
+
+
+def _listify_cli_args(value: Any) -> list[str]:
+    """Normalize config-provided CLI args into an argv-safe list."""
+    if value is None or value is False:
+        return []
+    if isinstance(value, str):
+        return shlex.split(value)
+    if isinstance(value, Iterable):
+        return [str(part) for part in value if str(part)]
+    return [str(value)]
+
+
+def _claude_code_command_for_task(task: "Task", prompt: str) -> Optional[list[str]]:
+    """Build argv for a configured Claude Code external Kanban lane."""
+    cc_cfg = _claude_code_config_for_assignee(task.assignee)
+    if cc_cfg is None:
+        return None
+    raw_command = cc_cfg.get("command") or "claude"
+    cmd = _listify_cli_args(raw_command)
+    if not cmd:
+        cmd = ["claude"]
+    permission_mode = str(cc_cfg.get("permission_mode") or "").strip()
+    if permission_mode:
+        cmd.extend(["--permission-mode", permission_mode])
+    effort = str(cc_cfg.get("effort") or "").strip()
+    if effort:
+        cmd.extend(["--effort", effort])
+    model = str(cc_cfg.get("model") or "").strip()
+    if model:
+        cmd.extend(["--model", model])
+    cmd.extend(_listify_cli_args(cc_cfg.get("extra_args")))
+    cmd.append(prompt)
+    return cmd
+
+
+def _scrub_claude_code_env_for_assignee(env: dict[str, str], assignee: Any) -> None:
+    cc_cfg = _claude_code_config_for_assignee(assignee)
+    if cc_cfg is None:
+        return
+    unset = cc_cfg.get("unset_env")
+    names = _listify_cli_args(unset) if unset is not None else [
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+    ]
+    for name in names:
+        env.pop(str(name), None)
+
+
+def _assignee_spawnable(assignee: Any) -> bool:
+    """Return whether the dispatcher can spawn ``assignee`` itself."""
+    name = str(assignee or "").strip()
+    if not name:
+        return False
+    if _is_configured_claude_code_assignee(name):
+        return True
+    try:
+        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
+    except Exception:
+        # Can't introspect — assume spawnable, preserve legacy behavior.
+        return True
+    return bool(profile_exists(name))
+
+
+def _handoff_policy(board: Optional[str] = None) -> dict[str, Any]:
+    """Return review/fix handoff continuation policy for a board.
+
+    Global keys live under ``kanban.*`` in config.yaml; per-board overrides may
+    be placed directly in ``board.json``.  The latter lets sensitive boards
+    (financial / live execution) stay serialized without forcing that policy on
+    unrelated project boards.
+    """
+    cfg = _load_kanban_cfg()
+    meta = read_board_metadata(board)
+
+    def pick(*names: str) -> str:
+        for name in names:
+            value = meta.get(name)
+            if value is None:
+                value = cfg.get(name)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    enabled = meta.get("handoff_continuation_enabled")
+    if enabled is None:
+        enabled = cfg.get("handoff_continuation_enabled", True)
+
+    serial_marker = any(
+        _truthy_config_value(meta.get(name))
+        for name in (
+            "serialized_dispatch",
+            "financial",
+            "financial_board",
+            "live_execution",
+            "live_execution_board",
+        )
+    )
+    parallel_approved = any(
+        _truthy_config_value(meta.get(name))
+        for name in (
+            "parallel_dispatch_approved",
+            "allow_parallel_dispatch",
+            "allow_parallel_handoff_dispatch",
+        )
+    ) or _truthy_config_value(cfg.get("allow_parallel_handoff_dispatch"))
+
+    return {
+        "enabled": _truthy_config_value(enabled),
+        "review_assignee": pick("review_assignee", "review_lane", "reviewer_assignee"),
+        "implementation_assignee": pick(
+            "implementation_assignee", "implementation_lane", "fix_assignee", "fix_lane"
+        ),
+        "serial_required": bool(serial_marker and not parallel_approved),
+    }
+
+
+def _coerce_optional_dispatch_cap(value: Any) -> Optional[int]:
+    """Normalize optional dispatch caps while preserving explicit pauses.
+
+    ``None`` means "no caller-supplied cap"; zero (and defensive negative
+    values) mean "spawn nothing" and must not be widened by board-level
+    serialization defaults.
+    """
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else 0
+
+
+def _apply_serial_dispatch_policy(
+    *,
+    max_spawn: Optional[int],
+    max_in_progress: Optional[int],
+    board: Optional[str],
+) -> tuple[Optional[int], Optional[int]]:
+    """Clamp dispatch concurrency to one on sensitive boards unless approved."""
+    policy = _handoff_policy(board)
+    parsed_spawn = _coerce_optional_dispatch_cap(max_spawn)
+    parsed_in_progress = _coerce_optional_dispatch_cap(max_in_progress)
+    if not policy.get("serial_required"):
+        return parsed_spawn, parsed_in_progress
+    if parsed_spawn is None or parsed_spawn > 1:
+        parsed_spawn = 1
+    if parsed_in_progress is None or parsed_in_progress > 1:
+        parsed_in_progress = 1
+    return parsed_spawn, parsed_in_progress
+
+
+def _decode_event_payload(payload: Any) -> dict[str, Any]:
+    if isinstance(payload, dict):
+        return payload
+    if isinstance(payload, str) and payload.strip():
+        try:
+            value = json.loads(payload)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+    return {}
+
+
+def _latest_block_reason(conn: sqlite3.Connection, task_id: str) -> str:
+    """Return the latest worker/operator block reason for ``task_id``."""
+    ev = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'blocked' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if ev is not None:
+        payload = _decode_event_payload(ev["payload"])
+        reason = payload.get("reason")
+        if isinstance(reason, str) and reason.strip():
+            return reason.strip()
+    run = conn.execute(
+        "SELECT summary FROM task_runs "
+        "WHERE task_id = ? AND outcome = 'blocked' "
+        "ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if run and isinstance(run["summary"], str):
+        return run["summary"].strip()
+    return ""
+
+
+def _is_review_required_handoff(reason: str) -> bool:
+    return bool(reason and _REVIEW_REQUIRED_PREFIX_RE.search(reason))
+
+
+def _is_fix_card_handoff(reason: str) -> bool:
+    return bool(reason and _FIX_CARD_HANDOFF_RE.search(reason))
+
+
+def _referenced_fix_cards(conn: sqlite3.Connection, task_id: str, reason: str) -> list[str]:
+    """Extract existing ``t_<hex>`` fix-card references from explicit handoffs.
+
+    A blocked task's comment thread can mention arbitrary sibling/parent task
+    IDs as context. Only the block reason itself, or comments that independently
+    use the narrow ``fix card created:`` convention, are authoritative sources
+    for the fix cards the supervisor should follow.
+    """
+    texts: list[str] = []
+    if _is_fix_card_handoff(reason):
+        texts.append(reason or "")
+    for row in conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? "
+        "ORDER BY id DESC LIMIT 20",
+        (task_id,),
+    ).fetchall():
+        body = row["body"] or ""
+        if _is_fix_card_handoff(body):
+            texts.append(body)
+    ids = []
+    seen: set[str] = set()
+    for text in texts:
+        for match in _TASK_ID_PROSE_RE.findall(text):
+            if match == task_id or match in seen:
+                continue
+            seen.add(match)
+            ids.append(match)
+
+    if not ids:
+        return []
+    placeholders = ",".join(["?"] * len(ids))
+    existing = {
+        row["id"]
+        for row in conn.execute(
+            f"SELECT id FROM tasks WHERE id IN ({placeholders})",
+            tuple(ids),
+        ).fetchall()
+    }
+    return [tid for tid in ids if tid in existing]
+
+
+def _route_fix_card_to_implementation(
+    conn: sqlite3.Connection,
+    *,
+    fix_id: str,
+    implementation_assignee: str,
+) -> bool:
+    """Assign a referenced fix card to the implementation lane when safe."""
+    if not implementation_assignee:
+        return False
+    row = conn.execute(
+        "SELECT status, assignee, claim_lock FROM tasks WHERE id = ?",
+        (fix_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    if row["status"] in {"running", "review", "done", "archived"}:
+        return False
+    if row["claim_lock"] is not None:
+        return False
+    if row["assignee"] == implementation_assignee:
+        return False
+    conn.execute(
+        "UPDATE tasks SET assignee = ?, consecutive_failures = 0, "
+        "last_failure_error = NULL WHERE id = ?",
+        (implementation_assignee, fix_id),
+    )
+    _append_event(
+        conn, fix_id, "assigned",
+        {"assignee": implementation_assignee, "reason": "expected_fix_handoff"},
+    )
+    return True
+
+
+def _reorient_fix_card_dependency(
+    conn: sqlite3.Connection,
+    *,
+    blocked_task_id: str,
+    fix_id: str,
+) -> bool:
+    """Make a fix card runnable when it was created as a child of its reviewer.
+
+    Workers often create follow-up cards with ``parents=[current_task]``.  For
+    a reviewer-created fix, that edge is backwards: the blocked reviewer should
+    wait on the fix, while the fix must not wait on the blocked reviewer.  This
+    rewrites ``reviewer -> fix`` into ``fix -> reviewer``.
+    """
+    changed = False
+    cur = conn.execute(
+        "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
+        (blocked_task_id, fix_id),
+    )
+    if cur.rowcount:
+        changed = True
+        _append_event(
+            conn, fix_id, "handoff_link_reoriented",
+            {"removed_parent": blocked_task_id, "reason": "fix_card_created"},
+        )
+    existing = conn.execute(
+        "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+        (fix_id, blocked_task_id),
+    ).fetchone()
+    if existing is None and not _would_cycle(conn, fix_id, blocked_task_id):
+        conn.execute(
+            "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+            (fix_id, blocked_task_id),
+        )
+        _append_event(
+            conn, blocked_task_id, "handoff_linked",
+            {"parent": fix_id, "child": blocked_task_id, "reason": "fix_card_created"},
+        )
+        changed = True
+    return changed
+
+
+def _move_blocked_task_to_review(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    reason_kind: str,
+    review_assignee: str,
+    fix_cards: Optional[list[str]] = None,
+) -> bool:
+    row = conn.execute(
+        "SELECT assignee FROM tasks WHERE id = ? AND status = 'blocked'",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    assignee = review_assignee or row["assignee"]
+    cur = conn.execute(
+        "UPDATE tasks SET status = 'review', assignee = ?, current_run_id = NULL, "
+        "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+        "consecutive_failures = 0, last_failure_error = NULL "
+        "WHERE id = ? AND status = 'blocked'",
+        (assignee, task_id),
+    )
+    if cur.rowcount != 1:
+        return False
+    payload: dict[str, Any] = {
+        "kind": reason_kind,
+        "status": "review",
+        "assignee": assignee,
+    }
+    if fix_cards:
+        payload["fix_cards"] = fix_cards
+    _append_event(conn, task_id, "handoff_continued", payload)
+    return True
+
+
+def _continue_expected_handoffs(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    dry_run: bool = False,
+) -> int:
+    """Advance expected review/fix handoffs without treating them as blockers.
+
+    True blockers stay in ``blocked``.  Only narrow conventions are automated:
+    ``review-required: ...`` and ``fix card created ... t_<id>``.  No workers
+    are spawned here; the normal dispatcher loop still enforces max-spawn and
+    per-board serialized-dispatch policy.  In ``dry_run`` mode, report how many
+    terminal expected handoffs would be continued without changing task state,
+    links, assignees, or events.
+    """
+    policy = _handoff_policy(board)
+    if not policy.get("enabled", True):
+        return 0
+
+    review_assignee = str(policy.get("review_assignee") or "").strip()
+    implementation_assignee = str(policy.get("implementation_assignee") or "").strip()
+
+    def _scan_and_maybe_continue() -> int:
+        continued = 0
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE status = 'blocked' ORDER BY priority DESC, created_at ASC"
+        ).fetchall()
+        for row in rows:
+            task_id = row["id"]
+            reason = _latest_block_reason(conn, task_id)
+            if _is_review_required_handoff(reason):
+                if dry_run:
+                    continued += 1
+                    continue
+                if _move_blocked_task_to_review(
+                    conn,
+                    task_id=task_id,
+                    reason_kind="review_required",
+                    review_assignee=review_assignee,
+                ):
+                    continued += 1
+                continue
+
+            if not _is_fix_card_handoff(reason):
+                continue
+            fix_ids = _referenced_fix_cards(conn, task_id, reason)
+            if not fix_ids:
+                continue
+
+            changed = False
+            if not dry_run:
+                for fix_id in fix_ids:
+                    changed = _reorient_fix_card_dependency(
+                        conn, blocked_task_id=task_id, fix_id=fix_id,
+                    ) or changed
+                    changed = _route_fix_card_to_implementation(
+                        conn,
+                        fix_id=fix_id,
+                        implementation_assignee=implementation_assignee,
+                    ) or changed
+
+            placeholders = ",".join(["?"] * len(fix_ids))
+            status_rows = conn.execute(
+                f"SELECT id, status FROM tasks WHERE id IN ({placeholders})",
+                tuple(fix_ids),
+            ).fetchall()
+            statuses = {r["id"]: r["status"] for r in status_rows}
+            all_done = bool(statuses) and all(
+                statuses.get(fid) in {"done", "archived"} for fid in fix_ids
+            )
+            if all_done:
+                if dry_run:
+                    continued += 1
+                    continue
+                if _move_blocked_task_to_review(
+                    conn,
+                    task_id=task_id,
+                    reason_kind="fix_card_completed",
+                    review_assignee=review_assignee,
+                    fix_cards=fix_ids,
+                ):
+                    continued += 1
+            elif changed:
+                _append_event(
+                    conn, task_id, "handoff_monitored",
+                    {"kind": "fix_card_created", "fix_cards": fix_ids, "statuses": statuses},
+                )
+        return continued
+
+    if dry_run:
+        return _scan_and_maybe_continue()
+    with write_txn(conn):
+        return _scan_and_maybe_continue()
+
+
 def specify_triage_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3683,6 +4208,8 @@ class DispatchResult:
 
     reclaimed: int = 0
     promoted: int = 0
+    handoff_continued: int = 0
+    """Blocked expected handoffs advanced to fix/review continuation."""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """List of ``(task_id, assignee, workspace_path)`` triples."""
     skipped_unassigned: list[str] = field(default_factory=list)
@@ -4663,13 +5190,8 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     ).fetchall()
     if not rows:
         return False
-    try:
-        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-    except Exception:
-        # Can't introspect — assume spawnable, preserve legacy behavior.
-        return True
     for row in rows:
-        if profile_exists(row["assignee"]):
+        if _assignee_spawnable(row["assignee"]):
             return True
     return False
 
@@ -4689,12 +5211,8 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     ).fetchall()
     if not rows:
         return False
-    try:
-        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-    except Exception:
-        return True
     for row in rows:
-        if profile_exists(row["assignee"]):
+        if _assignee_spawnable(row["assignee"]):
             return True
     return False
 
@@ -4739,6 +5257,15 @@ def dispatch_once(
     ``board`` pins workspace/log/db resolution for this tick to a specific
     board. When omitted, the current-board resolution chain is used.
     """
+    # Apply board-level dispatch safety before any spawn accounting. Sensitive
+    # financial/live-execution boards default to serialized dispatch unless the
+    # board metadata explicitly approves parallelism.
+    max_spawn, max_in_progress = _apply_serial_dispatch_policy(
+        max_spawn=max_spawn,
+        max_in_progress=max_in_progress,
+        board=board,
+    )
+
     # Reap zombie children from previously spawned workers.
     # The gateway-embedded dispatcher is the parent of every worker spawned
     # via _default_spawn (start_new_session=True only detaches the
@@ -4787,6 +5314,7 @@ def dispatch_once(
     if _crash_auto_blocked:
         result.auto_blocked.extend(_crash_auto_blocked)
     result.timed_out = enforce_max_runtime(conn)
+    result.handoff_continued = _continue_expected_handoffs(conn, board=board, dry_run=dry_run)
     result.promoted = recompute_ready(conn)
 
     # Count tasks already running so max_spawn enforces concurrency rather
@@ -4830,7 +5358,7 @@ def dispatch_once(
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
-        # Skip ready tasks whose assignee is not a real Hermes profile.
+        # Skip ready tasks whose assignee is not auto-spawnable.
         # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
         # with "Profile 'X' does not exist" when the assignee names a
         # control-plane lane (e.g. an interactive Claude Code terminal
@@ -4840,11 +5368,7 @@ def dispatch_once(
         # subprocess would crash on startup, get reaped as a zombie,
         # the task would loop back to ``ready`` on next tick, and we'd
         # burn CPU forever (#kanban-dispatcher-crash-loop 2026-05-05).
-        try:
-            from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row["assignee"]):
+        if not _assignee_spawnable(row["assignee"]):
             # Bucket separately from skipped_unassigned: the operator
             # cannot fix this by assigning a profile (the assignee IS the
             # intended owner — a terminal lane). Health telemetry uses
@@ -4876,6 +5400,7 @@ def dispatch_once(
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
+            spawned += 1
             continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
@@ -4945,15 +5470,12 @@ def dispatch_once(
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
-        try:
-            from hermes_cli.profiles import profile_exists
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row["assignee"]):
+        if not _assignee_spawnable(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
+            spawned += 1
             continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
@@ -5351,49 +5873,55 @@ def _default_spawn(
     # what the tool reads — set it explicitly here so comments are
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
+    _scrub_claude_code_env_for_assignee(env, task.assignee)
 
-    cmd = [
-        *_resolve_hermes_argv(),
-        "-p", profile_arg,
-        # Worker subprocesses switch to a profile-scoped HERMES_HOME above,
-        # so they see that profile's shell-hook allowlist instead of the
-        # dispatcher's root allowlist. Pass --accept-hooks explicitly so
-        # profile-local worker sessions still register configured hooks.
-        "--accept-hooks",
-    ]
-    # Auto-load the kanban-worker skill so every dispatched worker
-    # has the pattern library (good summary/metadata shapes, retry
-    # diagnostics, block-reason examples) in its context, even if
-    # the profile hasn't wired it into skills config. The MANDATORY
-    # lifecycle is already in the system prompt via KANBAN_GUIDANCE;
-    # this skill is the deeper reference. Users can point a profile
-    # at a different/additional skill via config if they want —
-    # --skills is additive to the profile's default skill set.
-    #
-    # Only add the flag when the skill actually resolves for the home
-    # the worker runs under: the bundled skill is absent from many
-    # profile-scoped skills dirs, and preloading a missing skill is
-    # fatal at CLI startup. Omitting it is safe — the lifecycle
-    # contract still ships via KANBAN_GUIDANCE.
-    if _kanban_worker_skill_available(env.get("HERMES_HOME")):
-        cmd.extend(["--skills", "kanban-worker"])
-    # Per-task force-loaded skills. Each name goes in its own
-    # `--skills X` pair rather than a single comma-joined arg: the CLI
-    # accepts both forms (action='append' + comma-split), but
-    # per-name pairs are easier to read in `ps` output and avoid any
-    # quoting ambiguity if a skill name ever contains unusual chars.
-    # Dedupe against the built-in so we don't double-load kanban-worker
-    # if a task author asks for it explicitly.
-    if task.skills:
-        for sk in task.skills:
-            if sk and sk != "kanban-worker":
-                cmd.extend(["--skills", sk])
-    if task.model_override:
-        cmd.extend(["-m", task.model_override])
-    cmd.extend([
-        "chat",
-        "-q", prompt,
-    ])
+    external_cmd = _claude_code_command_for_task(task, prompt)
+    if external_cmd is not None:
+        cmd = external_cmd
+    else:
+        cmd = [
+            *_resolve_hermes_argv(),
+            "-p", profile_arg,
+            # Worker subprocesses switch to a profile-scoped HERMES_HOME above,
+            # so they see that profile's shell-hook allowlist instead of the
+            # dispatcher's root allowlist. Pass --accept-hooks explicitly so
+            # profile-local worker sessions still register configured hooks.
+            "--accept-hooks",
+        ]
+    if external_cmd is None:
+        # Auto-load the kanban-worker skill so every dispatched worker
+        # has the pattern library (good summary/metadata shapes, retry
+        # diagnostics, block-reason examples) in its context, even if
+        # the profile hasn't wired it into skills config. The MANDATORY
+        # lifecycle is already in the system prompt via KANBAN_GUIDANCE;
+        # this skill is the deeper reference. Users can point a profile
+        # at a different/additional skill via config if they want —
+        # --skills is additive to the profile's default skill set.
+        #
+        # Only add the flag when the skill actually resolves for the home
+        # the worker runs under: the bundled skill is absent from many
+        # profile-scoped skills dirs, and preloading a missing skill is
+        # fatal at CLI startup. Omitting it is safe — the lifecycle
+        # contract still ships via KANBAN_GUIDANCE.
+        if _kanban_worker_skill_available(env.get("HERMES_HOME")):
+            cmd.extend(["--skills", "kanban-worker"])
+        # Per-task force-loaded skills. Each name goes in its own
+        # `--skills X` pair rather than a single comma-joined arg: the CLI
+        # accepts both forms (action='append' + comma-split), but
+        # per-name pairs are easier to read in `ps` output and avoid any
+        # quoting ambiguity if a skill name ever contains unusual chars.
+        # Dedupe against the built-in so we don't double-load kanban-worker
+        # if a task author asks for it explicitly.
+        if task.skills:
+            for sk in task.skills:
+                if sk and sk != "kanban-worker":
+                    cmd.extend(["--skills", sk])
+        if task.model_override:
+            cmd.extend(["-m", task.model_override])
+        cmd.extend([
+            "chat",
+            "-q", prompt,
+        ])
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and
@@ -5419,6 +5947,11 @@ def _default_spawn(
         )
     except FileNotFoundError:
         log_f.close()
+        if external_cmd is not None:
+            raise RuntimeError(
+                f"configured Claude Code launcher not found: {cmd[0]!r}. "
+                "Check kanban.claude_code.command in config.yaml."
+            )
         raise RuntimeError(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
@@ -6141,6 +6674,7 @@ def known_assignees(conn: sqlite3.Connection) -> list[dict]:
       the whole board.
     """
     on_disk = set(list_profiles_on_disk())
+    configured_external = _configured_claude_code_assignees()
 
     # Count tasks per (assignee, status), excluding archived.
     counts: dict[str, dict[str, int]] = {}
@@ -6151,7 +6685,7 @@ def known_assignees(conn: sqlite3.Connection) -> list[dict]:
     ):
         counts.setdefault(row["assignee"], {})[row["status"]] = int(row["n"])
 
-    names = sorted(on_disk | set(counts.keys()))
+    names = sorted(on_disk | configured_external | set(counts.keys()))
     return [
         {
             "name": name,

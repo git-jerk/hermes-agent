@@ -1554,6 +1554,23 @@ DEFAULT_CONFIG = {
         # large bulk-load of triage tasks from spending a burst of aux
         # LLM calls in one tick. Excess tasks defer to the next tick.
         "auto_decompose_per_tick": 3,
+        # Expected handoff continuation: workers/reviewers use blocked
+        # reasons like `review-required: ...` and `fix card created: t_...`
+        # as protocol handoffs, not terminal blockers. The dispatcher converts
+        # these into review/fix continuation states while true blockers stay
+        # blocked for humans. Per-board `board.json` may override these keys.
+        "handoff_continuation_enabled": True,
+        # Profile/lane used when an implementation task yields a
+        # review-required handoff. Empty = keep the task's current assignee.
+        "review_assignee": "",
+        # Profile/lane used for reviewer-created fix cards. Empty = preserve
+        # the fix card's existing assignee.
+        "implementation_assignee": "",
+        # Sensitive boards can set `financial`, `live_execution`, or
+        # `serialized_dispatch` in board.json; the dispatcher then clamps
+        # concurrency to one unless `parallel_dispatch_approved` (board) or
+        # this global escape hatch is true.
+        "allow_parallel_handoff_dispatch": False,
         # Stale detection: running tasks that have exceeded this many
         # seconds without a heartbeat (since ``last_heartbeat_at``) are
         # auto-reclaimed to ``ready`` on the next dispatcher tick. The

@@ -242,6 +242,53 @@ class TestBoardCRUD:
         assert again["description"] == "desc"
         assert again["icon"] == "📦"
 
+    def test_create_applies_kanban_board_defaults(self, fresh_home, monkeypatch):
+        import hermes_cli.config as cfg
+
+        policy = {
+            "enabled": True,
+            "mode": "claude-code-implementation-codexworker-review-default-synthesis",
+            "implementation_assignee": "claude-code",
+            "review_assignee": "codexworker",
+            "synthesis_assignee": "default",
+        }
+        monkeypatch.setattr(
+            cfg,
+            "load_config",
+            lambda: {"kanban": {"board_defaults": {"routing_policy": policy}}},
+        )
+
+        meta = kb.create_board("autowired")
+
+        assert meta["routing_policy"] == policy
+        again = kb.read_board_metadata("autowired")
+        assert again["routing_policy"] == policy
+
+    def test_board_defaults_do_not_override_existing_metadata(self, fresh_home, monkeypatch):
+        import hermes_cli.config as cfg
+
+        original_policy = {"enabled": True, "mode": "custom"}
+        updated_default_policy = {"enabled": True, "mode": "global-default"}
+        monkeypatch.setattr(
+            cfg,
+            "load_config",
+            lambda: {"kanban": {"board_defaults": {"routing_policy": original_policy}}},
+        )
+        kb.create_board("customized")
+        path = kb.board_metadata_path("customized")
+        meta = json.loads(path.read_text())
+        meta["routing_policy"] = original_policy
+        path.write_text(json.dumps(meta))
+
+        monkeypatch.setattr(
+            cfg,
+            "load_config",
+            lambda: {"kanban": {"board_defaults": {"routing_policy": updated_default_policy}}},
+        )
+        kb.write_board_metadata("customized", name="Custom Name")
+
+        assert kb.read_board_metadata("customized")["routing_policy"] == original_policy
+
     def test_remove_archive(self, fresh_home):
         kb.create_board("toremove")
         res = kb.remove_board("toremove")
@@ -428,6 +475,79 @@ class TestWorkerSpawnEnv:
         assert env["HERMES_KANBAN_DB"] == str(expected_db)
         expected_ws = fresh_home / "kanban" / "boards" / "spawntest" / "workspaces"
         assert env["HERMES_KANBAN_WORKSPACES_ROOT"] == str(expected_ws)
+
+    def test_configured_claude_code_spawn_uses_external_launcher(self, fresh_home, monkeypatch):
+        captured = {}
+
+        class FakeProc:
+            pid = 24680
+
+        def fake_popen(cmd, *args, **kwargs):
+            captured["cmd"] = cmd
+            captured["env"] = kwargs.get("env", {})
+            return FakeProc()
+
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(
+            kb,
+            "_load_kanban_cfg",
+            lambda: {
+                "claude_code": {
+                    "enabled": True,
+                    "assignees": ["claude-code"],
+                    "command": "/tmp/claude-csw",
+                    "permission_mode": "dontAsk",
+                    "effort": "low",
+                    "model": "sonnet",
+                    "extra_args": ["--dangerously-skip-permissions"],
+                    "unset_env": ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"],
+                }
+            },
+        )
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "must-not-leak")
+        monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "must-not-leak")
+        kb.create_board("claude-board")
+        task = kb.Task(
+            id="t_cc",
+            title="claude worker test",
+            body=None,
+            assignee="claude-code",
+            status="ready",
+            priority=0,
+            created_by="user",
+            created_at=0,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="scratch",
+            workspace_path=None,
+            claim_lock="host:123",
+            claim_expires=None,
+            tenant=None,
+            current_run_id=99,
+        )
+
+        pid = kb._default_spawn(task, str(fresh_home / "ws"), board="claude-board")
+
+        assert pid == 24680
+        assert captured["cmd"] == [
+            "/tmp/claude-csw",
+            "--permission-mode",
+            "dontAsk",
+            "--effort",
+            "low",
+            "--model",
+            "sonnet",
+            "--dangerously-skip-permissions",
+            "work kanban task t_cc",
+        ]
+        env = captured["env"]
+        assert env["HERMES_PROFILE"] == "claude-code"
+        assert env["HERMES_KANBAN_BOARD"] == "claude-board"
+        assert env["HERMES_KANBAN_TASK"] == "t_cc"
+        assert env["HERMES_KANBAN_RUN_ID"] == "99"
+        assert env["HERMES_KANBAN_CLAIM_LOCK"] == "host:123"
+        assert "ANTHROPIC_API_KEY" not in env
+        assert "ANTHROPIC_AUTH_TOKEN" not in env
 
     def test_default_board_spawn_keeps_legacy_paths(self, fresh_home, monkeypatch):
         captured = {}

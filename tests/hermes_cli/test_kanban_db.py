@@ -1035,6 +1035,61 @@ def test_dispatch_skips_nonspawnable_into_separate_bucket(kanban_home, monkeypat
     assert not res.spawned
 
 
+def test_dispatch_treats_configured_claude_code_lane_as_spawnable(kanban_home, monkeypatch):
+    """Configured Claude Code lanes are external workers, not profiles.
+
+    They must not be bucketed as non-spawnable just because no profile
+    directory exists on disk. This must hold for any board because the
+    configuration is global.
+    """
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: False)
+    monkeypatch.setattr(
+        kb,
+        "_load_kanban_cfg",
+        lambda: {
+            "claude_code": {
+                "enabled": True,
+                "assignees": ["claude-code"],
+                "command": "/tmp/claude-csw",
+            }
+        },
+    )
+    with kb.connect(board="future-board") as conn:
+        t = kb.create_task(conn, title="research lane", assignee="claude-code")
+        res = kb.dispatch_once(conn, dry_run=True, board="future-board")
+
+        assert kb.has_spawnable_ready(conn) is True
+
+    assert res.spawned == [(t, "claude-code", "")]
+    assert t not in res.skipped_nonspawnable
+    assert t not in res.skipped_unassigned
+
+
+def test_known_assignees_includes_configured_claude_code_lane_on_empty_board(
+    kanban_home, monkeypatch
+):
+    """Fresh/future boards should offer configured external lanes immediately."""
+    monkeypatch.setattr(
+        kb,
+        "_load_kanban_cfg",
+        lambda: {
+            "claude_code": {
+                "enabled": True,
+                "assignees": ["claude-code"],
+                "command": "/tmp/claude-csw",
+            }
+        },
+    )
+    with kb.connect(board="brand-new") as conn:
+        assignees = {row["name"]: row for row in kb.known_assignees(conn)}
+
+    assert "claude-code" in assignees
+    assert assignees["claude-code"]["on_disk"] is False
+    assert assignees["claude-code"]["counts"] == {}
+
+
 def test_has_spawnable_ready_false_when_only_terminal_lanes(kanban_home, monkeypatch):
     """``has_spawnable_ready`` returns False when every ready task is
     assigned to a control-plane lane — used by gateway/CLI dispatchers
