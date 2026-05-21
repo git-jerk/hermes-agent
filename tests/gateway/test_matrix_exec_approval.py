@@ -27,9 +27,9 @@ class TestMatrixExecApprovalReactions:
         assert result.success is True
         assert adapter._approval_prompt_by_session["sess-1"] == "$evt1"
         assert adapter._approval_prompts_by_event["$evt1"].session_key == "sess-1"
-        assert adapter._send_reaction.await_count == 3
+        assert adapter._send_reaction.await_count == 4
         emojis = [call.args[2] for call in adapter._send_reaction.await_args_list]
-        assert emojis == ["✅", "♾️", "❎"]
+        assert emojis == ["✅", "♾️", "🔁", "❎"]
 
     @pytest.mark.asyncio
     async def test_reaction_resolves_pending_approval(self, monkeypatch):
@@ -75,6 +75,33 @@ class TestMatrixExecApprovalReactions:
         event = types.SimpleNamespace(
             sender="@liizfq:liizfq.top",
             event_id="$react-always",
+            room_id="!room:example.org",
+            content=content,
+        )
+
+        with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
+            await adapter._on_reaction(event)
+
+        mock_resolve.assert_called_once_with("sess-1", "always")
+        assert "$target" not in adapter._approval_prompts_by_event
+        assert "sess-1" not in adapter._approval_prompt_by_session
+
+    @pytest.mark.asyncio
+    async def test_repeat_reaction_resolves_pending_approval_always(self, monkeypatch):
+        monkeypatch.setenv("MATRIX_ALLOWED_USERS", "@liizfq:liizfq.top")
+        from gateway.platforms.matrix import MatrixAdapter, _MatrixApprovalPrompt
+
+        adapter = MatrixAdapter(PlatformConfig(enabled=True, token="tok", extra={"homeserver": "https://matrix.example.org"}))
+        adapter._user_id = "@bot:example.org"
+        adapter._approval_prompts_by_event["$target"] = _MatrixApprovalPrompt(
+            session_key="sess-1", chat_id="!room:example.org", message_id="$target"
+        )
+        adapter._approval_prompt_by_session["sess-1"] = "$target"
+
+        content = {"m.relates_to": {"event_id": "$target", "key": "🔁"}}
+        event = types.SimpleNamespace(
+            sender="@liizfq:liizfq.top",
+            event_id="$react-repeat-always",
             room_id="!room:example.org",
             content=content,
         )
