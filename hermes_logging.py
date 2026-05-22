@@ -138,6 +138,27 @@ class _ComponentFilter(logging.Filter):
         return record.name.startswith(self._prefixes)
 
 
+class _DropMCPCodexValidationNoise(logging.Filter):
+    """Drop MCP SDK notification-validation warnings for codex/* extension methods.
+
+    The MCP Python SDK's ``ClientNotification`` union doesn't recognise
+    ``codex/event`` (a codex-specific extension), so every codex notification
+    spams a WARNING from ``mcp.shared.session`` via the root logger.  Hermes
+    still functions correctly — the SDK just logs the failed Pydantic parse.
+    Drop only this exact noise; let unrelated notification-validation
+    warnings through.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        if "Failed to validate notification" in msg and "method='codex/" in msg:
+            return False
+        return True
+
+
 # Logger name prefixes that belong to each component.
 # Used by _ComponentFilter and exposed for ``hermes logs --component``.
 COMPONENT_PREFIXES = {
@@ -254,6 +275,9 @@ def setup_logging(
     # Suppress noisy third-party loggers.
     for name in _NOISY_LOGGERS:
         logging.getLogger(name).setLevel(logging.WARNING)
+
+    # Drop MCP SDK validation-warning spam for codex extension notifications.
+    root.addFilter(_DropMCPCodexValidationNoise())
 
     _logging_initialized = True
     return log_dir
