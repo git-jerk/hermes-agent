@@ -77,6 +77,16 @@ dependencies = [
   # matrix extra's `mautrix`/`python-olm` it's safe to ship everywhere — keeps
   # it out of the lazy-install path that exists only for the heavy matrix deps.
   "Markdown==3.10.2",
+  # PostgreSQL driver for the pluggable kanban storage backend
+  # (hermes_cli/kanban_storage/postgres_backend.py). The ``binary`` extra
+  # bundles libpq via psycopg-binary, avoiding a host-level libpq dep on
+  # Mac/Windows. The ``pool`` extra adds psycopg_pool.ConnectionPool, which
+  # the gateway uses to keep checkout costs near-zero for the many short-
+  # lived kanban queries it issues per tick. The migration from SQLite to
+  # PG is the durability fix for the WAL/shm sidecar corruption that hit
+  # trading-lab / research / qraav in May 2026 — see
+  # docs/kanban-storage-postgres-migration.md.
+  "psycopg[binary,pool]==3.2.10",
   # Skills Hub (GitHub App JWT auth — optional, only needed for bot identity)
   "PyJWT[crypto]==2.13.0",  # PYSEC-2026-175/177/178/179
   # urllib3 2.7.0 fixes GHSA-mf9v-mfxr-j63j (decompression-bomb bypass)
