@@ -301,6 +301,102 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     b_set_wd.add_argument("path", nargs="?", default=None,
                           help="Absolute path to use as default workdir. Omit to clear.")
 
+    # ---- storage backend (sqlite vs postgres) ----------------------
+    p_storage = sub.add_parser(
+        "storage",
+        help="Manage the kanban storage backend (sqlite vs postgres)",
+        description=(
+            "Operate on the per-board storage backend. Each board can "
+            "independently sit on SQLite (the legacy default, one DB "
+            "file per board) or PostgreSQL (one PG schema per board "
+            "inside a shared DSN). Use 'status' to see the current "
+            "resolution and 'migrate' to flip a board from SQLite to "
+            "PG, preserving task IDs, run history, event log, and "
+            "notification cursors. See docs/kanban-storage-postgres-"
+            "migration.md for the full design rationale."
+        ),
+    )
+    storage_sub = p_storage.add_subparsers(dest="storage_action")
+
+    s_status = storage_sub.add_parser(
+        "status",
+        help="Print the resolved storage backend for one or all boards",
+    )
+    s_status.add_argument("--board", default=None,
+                          help="Inspect only this board (defaults to all)")
+    s_status.add_argument("--json", action="store_true",
+                          help="Emit machine-readable JSON")
+
+    s_migrate = storage_sub.add_parser(
+        "migrate",
+        help="Migrate one or all boards from SQLite to PostgreSQL",
+        description=(
+            "Copies tasks / links / runs / events / comments / notify "
+            "subscriptions from the board's SQLite DB into a per-board "
+            "PostgreSQL schema, then flips board.json so subsequent "
+            "connect() calls route at PG. The SQLite file is renamed "
+            "to .migrated-<timestamp> (kept for rollback). Run this "
+            "with the gateway/dispatcher stopped."
+        ),
+    )
+    s_migrate_target = s_migrate.add_mutually_exclusive_group(required=True)
+    s_migrate_target.add_argument(
+        "--board", default=None,
+        help="Migrate a single board by slug",
+    )
+    s_migrate_target.add_argument(
+        "--all", action="store_true",
+        help="Migrate every (non-archived) board the install knows about",
+    )
+    s_migrate.add_argument(
+        "--to", dest="storage_to", choices=["postgres"], default="postgres",
+        help="Target backend (only postgres is supported in this release)",
+    )
+    s_migrate.add_argument(
+        "--target-dsn", default=None,
+        help="PostgreSQL connection string. Defaults to "
+             "$HERMES_KANBAN_POSTGRES_DSN.",
+    )
+    s_migrate.add_argument(
+        "--target-dsn-env", default="HERMES_KANBAN_POSTGRES_DSN",
+        help="Env var name to record in board.json (the credential itself "
+             "is NOT written to disk).",
+    )
+    s_migrate.add_argument(
+        "--target-schema", default=None,
+        help="Per-board PG schema (single-board only; defaults to "
+             "kanban_<slug>)",
+    )
+    s_migrate.add_argument(
+        "--dry-run", action="store_true",
+        help="Count rows and validate columns but make no writes.",
+    )
+    s_migrate.add_argument(
+        "--force", action="store_true",
+        help="Truncate the target schema if it already has rows.",
+    )
+    s_migrate.add_argument(
+        "--allow-live", action="store_true",
+        help="Skip the 'WAL is non-empty' safety check.",
+    )
+    s_migrate.add_argument(
+        "--no-rename-sqlite", action="store_true",
+        help="Leave the kanban.db file in place after migration.",
+    )
+    s_migrate.add_argument(
+        "--no-update-board-json", action="store_true",
+        help="Don't flip board.json's kanban.storage.backend to postgres. "
+             "Use for shadow-write validation.",
+    )
+    s_migrate.add_argument(
+        "--include-archived", action="store_true",
+        help="With --all, also migrate archived boards.",
+    )
+    s_migrate.add_argument(
+        "--json", action="store_true",
+        help="Emit a JSON report instead of human text.",
+    )
+
     # --- create ---
     p_create = sub.add_parser("create", help="Create a new task")
     p_create.add_argument("title", help="Task title")
@@ -827,6 +923,9 @@ def kanban_command(args: argparse.Namespace) -> int:
     if action == "boards":
         return _dispatch_boards(args)
 
+    if action == "storage":
+        return _dispatch_storage(args)
+
     # `--board <slug>` applies to every subcommand below by way of an
     # env-var pin for the duration of this call. Using HERMES_KANBAN_BOARD
     # (rather than threading `board=` through 50+ kb.connect() sites)
@@ -979,6 +1078,152 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
         return _cmd_boards_set_default_workdir(args)
     print(f"kanban boards: unknown action {sub!r}", file=sys.stderr)
     return 2
+
+
+def _dispatch_storage(args: argparse.Namespace) -> int:
+    """``hermes kanban storage <action>`` dispatcher.
+
+    Storage management is independent of the per-task commands: it
+    operates on board.json (to flip backends) and on the SQLite/PG
+    files themselves (to migrate data). It doesn't open the kanban DB
+    through the normal connect() path — the migrator uses dedicated
+    sqlite3 + psycopg connections so it can do its work even when the
+    board's storage config is mid-flip.
+    """
+    sub = getattr(args, "storage_action", None) or "status"
+    if sub == "status":
+        return _cmd_storage_status(args)
+    if sub == "migrate":
+        return _cmd_storage_migrate(args)
+    print(f"kanban storage: unknown action {sub!r}", file=sys.stderr)
+    return 2
+
+
+def _cmd_storage_status(args: argparse.Namespace) -> int:
+    """Print which backend each board resolves to right now."""
+    import json as _json
+
+    from hermes_cli.kanban_storage import resolve_storage_config
+
+    target = getattr(args, "board", None)
+    if target:
+        slugs = [target]
+    else:
+        slugs = [b["slug"] for b in kb.list_boards(include_archived=True)]
+
+    out = []
+    for slug in slugs:
+        try:
+            cfg = resolve_storage_config(slug)
+            out.append({
+                "board": slug,
+                "backend": cfg.backend,
+                "sqlite_path": cfg.sqlite_path,
+                "postgres_schema": cfg.postgres_schema,
+                "postgres_dsn_host": (
+                    cfg.postgres_dsn.rsplit("@", 1)[-1]
+                    if cfg.postgres_dsn and "@" in cfg.postgres_dsn
+                    else cfg.postgres_dsn
+                ),
+            })
+        except Exception as exc:
+            out.append({"board": slug, "error": str(exc)})
+
+    if getattr(args, "json", False):
+        print(_json.dumps(out, indent=2))
+        return 0
+    for row in out:
+        if "error" in row:
+            print(f"  {row['board']:24} ERROR: {row['error']}")
+            continue
+        if row["backend"] == "sqlite":
+            print(f"  {row['board']:24} sqlite   {row['sqlite_path']}")
+        else:
+            print(f"  {row['board']:24} postgres schema={row['postgres_schema']} "
+                  f"@ {row['postgres_dsn_host']}")
+    return 0
+
+
+def _cmd_storage_migrate(args: argparse.Namespace) -> int:
+    """Execute the SQLite → Postgres migration for one or all boards."""
+    import json as _json
+    import os as _os
+
+    from hermes_cli.kanban_storage import migrate_data
+
+    target_dsn = (
+        args.target_dsn
+        or _os.environ.get(args.target_dsn_env, "").strip()
+        or _os.environ.get("HERMES_KANBAN_POSTGRES_DSN", "").strip()
+    )
+    if not target_dsn:
+        print(
+            f"kanban storage migrate: no DSN found in --target-dsn or "
+            f"${args.target_dsn_env}. Pass --target-dsn or set the env var.",
+            file=sys.stderr,
+        )
+        return 2
+
+    common_kwargs = dict(
+        target_dsn=target_dsn,
+        target_dsn_env=args.target_dsn_env,
+        dry_run=args.dry_run,
+        force=args.force,
+        allow_live=args.allow_live,
+        rename_sqlite=not args.no_rename_sqlite,
+        update_board_json=not args.no_update_board_json,
+    )
+
+    try:
+        if args.all:
+            reports = migrate_data.migrate_all_boards(
+                include_archived=args.include_archived,
+                **common_kwargs,
+            )
+        else:
+            single = migrate_data.migrate_board(
+                board=args.board,
+                target_schema=args.target_schema,
+                **common_kwargs,
+            )
+            reports = [single]
+    except migrate_data.MigrationError as exc:
+        print(f"migration aborted: {exc}", file=sys.stderr)
+        return 1
+
+    payload = [r.as_dict() for r in reports]
+    if args.json:
+        print(_json.dumps(payload, indent=2))
+        return 0
+
+    # Human-readable summary.
+    print(f"Migrated {len(payload)} board(s) "
+          f"({'dry run' if args.dry_run else 'live'}):")
+    for r in payload:
+        if r["skipped_reason"]:
+            print(f"  {r['board']:24} SKIPPED — {r['skipped_reason']}")
+            continue
+        rows = r["rows_per_table"]
+        total = sum(rows.values())
+        print(f"  {r['board']:24} → {r['target_schema']:28} "
+              f"{total:5d} rows in {r['duration_seconds']:.2f}s")
+        for table, n in sorted(rows.items()):
+            print(f"      {table:24} {n:5d}")
+        if r["sqlite_renamed_to"]:
+            print(f"      sqlite renamed: {r['sqlite_renamed_to']}")
+        if r["board_json_updated"]:
+            print(f"      board.json:     updated (backend=postgres)")
+
+    if not args.dry_run:
+        any_flipped = any(r["board_json_updated"] for r in payload)
+        if any_flipped:
+            print(
+                "\nNext step: restart the gateway/dispatcher so it picks "
+                "up the new backend (it caches connections per-process). "
+                f"Make sure ${args.target_dsn_env} is set in its env."
+            )
+
+    return 0
 
 
 def _board_task_counts(slug: str) -> dict[str, int]:

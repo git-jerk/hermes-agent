@@ -1,0 +1,67 @@
+# Dedicated Postgres for Hermes Kanban storage.
+#
+# Kept isolated from the openclaw-postgres pgvector instance (port 8432) and
+# openclaw-timescaledb (port 8433) so that a kanban restart, vacuum, or
+# version bump doesn't touch the embedding store. One DSN, many per-board
+# schemas (kanban_default, kanban_trading_lab, ...).
+#
+# Bring up:  docker compose -f docker-compose.kanban-pg.yml up -d
+# Tear down: docker compose -f docker-compose.kanban-pg.yml down
+# Open psql: docker exec -it hermes-kanban-pg psql -U hermes -d hermes_kanban
+#
+# DSN (for HERMES_KANBAN_POSTGRES_DSN):
+#   postgresql://hermes:hermes_kanban_local@127.0.0.1:8434/hermes_kanban
+#
+# Persistence: ~/.hermes/kanban/postgres-data is a bind mount so a docker
+# rm/rebuild doesn't lose data. To nuke the data, `docker compose down -v`
+# does NOT remove a bind mount; you must `rm -rf ~/.hermes/kanban/postgres-data`
+# explicitly. That asymmetry is deliberate — a stray `down -v` should not
+# delete the kanban source-of-truth.
+
+services:
+  hermes-kanban-pg:
+    image: postgres:16-alpine
+    container_name: hermes-kanban-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: hermes
+      POSTGRES_PASSWORD: hermes_kanban_local
+      POSTGRES_DB: hermes_kanban
+      # Slightly tuned for the workload: many small write txns, small data.
+      # Postgres defaults assume bigger workloads; these knobs make the
+      # container lighter without hurting durability.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    command:
+      - postgres
+      - -c
+      - shared_buffers=128MB
+      - -c
+      - effective_cache_size=512MB
+      - -c
+      - work_mem=8MB
+      - -c
+      - maintenance_work_mem=64MB
+      - -c
+      - max_connections=100
+      # Aggressive autovacuum because our workload is update-heavy on
+      # tasks (claim/heartbeat/complete cycles) and we want to avoid
+      # the dead-tuple bloat that the contrarian "Postgres-as-queue"
+      # critique flags. At our scale (<2 MB per board) autovacuum
+      # has plenty of headroom.
+      - -c
+      - autovacuum_naptime=15s
+      - -c
+      - autovacuum_vacuum_scale_factor=0.05
+      - -c
+      - autovacuum_analyze_scale_factor=0.025
+      # Synchronous commit ON (the default) is what we want — durability
+      # is the whole point of this migration.
+    ports:
+      - "127.0.0.1:8434:5432"
+    volumes:
+      - ${HOME}/.hermes/kanban/postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hermes -d hermes_kanban"]
+      interval: 5s
+      timeout: 3s
+      retries: 20

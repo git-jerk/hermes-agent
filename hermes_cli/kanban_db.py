@@ -89,6 +89,29 @@ from typing import Any, Iterable, Optional
 
 from toolsets import get_toolset_names
 
+# Pluggable storage backend. The selector resolves sqlite vs postgres
+# per board (from board.json or env), opens a connection that quacks
+# like sqlite3.Connection in both cases, and dispatches write_txn to
+# the matching backend. The migration to postgres lives in
+# ``docs/kanban-storage-postgres-migration.md`` — the gist is that
+# multi-process WAL+shm sidecar racing on APFS was producing
+# ``database disk image is malformed`` on several boards.
+#
+# Functions in this module continue to accept ``sqlite3.Connection``
+# in their type annotations because that's what they get on the
+# default (sqlite) path. The postgres path returns a
+# ``PgConnectionWrapper`` that exposes the same ``.execute()`` / row
+# subscript / ``.lastrowid`` / ``.rowcount`` surface, so the 186
+# call sites in this file work unchanged.
+from hermes_cli.kanban_storage import (
+    open_connection as _open_connection_via_storage,
+    init_schema as _init_schema_via_storage,
+    write_txn as _write_txn_via_storage,
+    resolve_storage_config as _resolve_storage_config,
+    clear_caches as _clear_storage_caches,
+)
+from hermes_cli.kanban_storage.selector import _config_for_conn as _conn_config
+
 _log = logging.getLogger(__name__)
 
 
@@ -591,9 +614,10 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
         clear_current_board()
 
     # A concurrent connect(board=normed) after the rename/delete recreates
-    # an empty sqlite file via mkdir(exist_ok=True); the cache entry must be
-    # dropped first so the schema init pass re-runs on that fresh file.
-    _INITIALIZED_PATHS.discard(str((d / "kanban.db").resolve()))
+    # an empty sqlite file via mkdir(exist_ok=True); both init caches
+    # (base schema in sqlite_backend, additive migration in this module)
+    # must drop the entry so the next open re-applies the full init pass.
+    _invalidate_init_cache(str((d / "kanban.db").resolve()))
 
     if archive:
         archive_root = boards_root() / "_archived"
@@ -969,8 +993,31 @@ CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_
 # Connection helpers
 # ---------------------------------------------------------------------------
 
+# Per-process "additive migration done" cache, keyed on the resolved
+# sqlite path (or "pg:<dsn>:<schema>" for the postgres path). The base
+# schema cache lives in :mod:`hermes_cli.kanban_storage.sqlite_backend`
+# under the same name; both are cleared together by
+# :func:`_invalidate_init_cache` so that ``remove_board()`` and tests
+# that recycle DB files get a clean reinit on the next open.
 _INITIALIZED_PATHS: set[str] = set()
 _INIT_LOCK = threading.RLock()
+
+
+def _invalidate_init_cache(resolved_path: str) -> None:
+    """Drop ``resolved_path`` from both init caches.
+
+    Use whenever a kanban DB file is deleted/renamed/archived so a
+    subsequent ``connect()`` re-runs SCHEMA_SQL and the additive
+    migration pass. Keeping the two caches in sync from one helper
+    avoids stale-cache regressions like #23833 (re-create-after-remove
+    silently skipping init).
+    """
+    from hermes_cli.kanban_storage import sqlite_backend as _sb
+
+    with _INIT_LOCK:
+        _INITIALIZED_PATHS.discard(resolved_path)
+    with _sb._INIT_LOCK:
+        _sb._INITIALIZED_PATHS.discard(resolved_path)
 _SQLITE_HEADER = b"SQLite format 3\x00"
 
 
@@ -1029,57 +1076,55 @@ def connect(
     db_path: Optional[Path] = None,
     *,
     board: Optional[str] = None,
-) -> sqlite3.Connection:
+):
     """Open (and initialize if needed) the kanban DB.
 
-    WAL mode is enabled on every connection; it's a no-op after the first
-    time but keeps the code robust if the DB file is ever re-created.
+    Returns a connection object that quacks like :class:`sqlite3.Connection`
+    regardless of the actual backend (sqlite or postgres). The selector
+    in :mod:`hermes_cli.kanban_storage` picks the backend from board.json
+    + env; see ``docs/kanban-storage-postgres-migration.md``.
 
-    The first connection to a given path auto-runs :func:`init_db` so
-    fresh installs and test harnesses that construct `connect()`
-    directly don't have to remember a separate init step. Subsequent
-    connections skip the schema check via a module-level path cache.
+    The first connection to a given board auto-runs the schema +
+    additive migration pass so fresh installs and test harnesses that
+    construct ``connect()`` directly don't have to remember a separate
+    init step. Subsequent connections skip the additive pass via the
+    module-level :data:`_INITIALIZED_PATHS` cache.
 
-    Path resolution:
+    Path / board resolution:
 
-    * ``db_path`` explicit → used as-is (legacy callers, tests).
-    * ``board`` explicit → resolves to that board's DB.
-    * Neither → :func:`kanban_db_path` resolves via
-      ``HERMES_KANBAN_DB`` env → ``HERMES_KANBAN_BOARD`` env →
+    * ``db_path`` explicit → forces sqlite backend with that file
+      (legacy callers, tests).
+    * ``board`` explicit → resolves to that board's storage config.
+    * Neither → :func:`kanban_db_path` / :func:`get_current_board`
+      resolve via ``HERMES_KANBAN_DB`` → ``HERMES_KANBAN_BOARD`` →
       ``<root>/kanban/current`` → ``default``.
     """
-    if db_path is not None:
-        path = db_path
-    else:
-        path = kanban_db_path(board=board)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _validate_sqlite_header(path)
-    resolved = str(path.resolve())
-    conn = sqlite3.connect(str(path), isolation_level=None, timeout=30)
+    conn = _open_connection_via_storage(board=board, db_path=db_path)
     try:
-        conn.row_factory = sqlite3.Row
-        with _INIT_LOCK:
-            # WAL activation can take an exclusive lock while SQLite creates the
-            # sidecar files for a fresh database. Keep it in the same process-local
-            # critical section as schema initialization so concurrent gateway
-            # startup threads do not race before _INITIALIZED_PATHS is populated.
-            # WAL doesn't work on network filesystems (NFS/SMB/FUSE). Shared helper
-            # falls back to DELETE with one WARNING so kanban stays usable there.
-            # See hermes_state._WAL_INCOMPAT_MARKERS for detection logic.
-            from hermes_state import apply_wal_with_fallback
-            apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA foreign_keys=ON")
-            needs_init = resolved not in _INITIALIZED_PATHS
-            if needs_init:
-                # Idempotent: runs CREATE TABLE IF NOT EXISTS + the additive
-                # migrations. Cached so subsequent connect() calls in the same
-                # process are cheap. The lock prevents same-process dispatcher
-                # threads from racing through the additive ALTER TABLE pass with
-                # stale PRAGMA snapshots during gateway startup.
-                conn.executescript(SCHEMA_SQL)
-                _migrate_add_optional_columns(conn)
-                _INITIALIZED_PATHS.add(resolved)
+        # Pull the resolved storage config off the connection. sqlite3
+        # rejects arbitrary attribute assignment so the selector stashes
+        # it in a side-table when the direct attr fails; _conn_config
+        # consults both paths.
+        config = _conn_config(conn)
+        # Cache key: for sqlite use the resolved file path (matches
+        # legacy behaviour); for postgres use board name (PG schema
+        # creation already cached inside the backend, but we still
+        # gate the additive migration here).
+        if config is None or config.backend == "sqlite":
+            cache_key = str(Path(config.sqlite_path).resolve()) if (config and config.sqlite_path) else None
+        else:
+            cache_key = f"pg:{config.postgres_dsn}:{config.postgres_schema}"
+        if cache_key is not None:
+            with _INIT_LOCK:
+                if cache_key not in _INITIALIZED_PATHS:
+                    # Run the additive ALTER-TABLE / index / one-shot
+                    # backfill pass. On a fresh schema (sqlite or PG
+                    # via the storage layer's CREATE TABLE) this is a
+                    # near-no-op; on legacy DBs it brings them up to
+                    # current shape. Idempotent so repeated runs are
+                    # safe.
+                    _migrate_add_optional_columns(conn)
+                    _INITIALIZED_PATHS.add(cache_key)
     except Exception:
         conn.close()
         raise
@@ -1107,11 +1152,24 @@ def init_db(
         path = kanban_db_path(board=board)
     path.parent.mkdir(parents=True, exist_ok=True)
     resolved = str(path.resolve())
-    # Clear the cache entry so the underlying connect() re-runs the
-    # schema + migration pass unconditionally.
+    # Clear the cache entries so the underlying connect() re-runs the
+    # schema + migration pass unconditionally. Cover both the sqlite
+    # path-keyed entry and the postgres board-keyed entry so callers
+    # who flipped a board between backends don't see stale state.
+    _invalidate_init_cache(resolved)
     with _INIT_LOCK:
-        _INITIALIZED_PATHS.discard(resolved)
-    with contextlib.closing(connect(path)):
+        if board is not None:
+            # PG cache keys are derived in connect(); the simplest
+            # invalidation is to drop everything for this board.
+            stale = {
+                k for k in _INITIALIZED_PATHS
+                if k.startswith("pg:") and k.endswith(f":kanban_{board}")
+            }
+            _INITIALIZED_PATHS.difference_update(stale)
+    # Also clear the storage selector's cache so a board.json change
+    # is picked up on the next connect.
+    _clear_storage_caches()
+    with contextlib.closing(connect(board=board) if db_path is None else connect(path)):
         pass
     return path
 
@@ -1354,21 +1412,20 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
 
 @contextlib.contextmanager
-def write_txn(conn: sqlite3.Connection):
-    """Context manager for an IMMEDIATE write transaction.
+def write_txn(conn):
+    """Context manager for an exclusive write transaction.
 
-    Use for any multi-statement write (creating a task + link, claiming a
-    task + recording an event, etc.).  A claim CAS inside this context is
-    atomic -- at most one concurrent writer can succeed.
+    On sqlite this is ``BEGIN IMMEDIATE``; on postgres it's a plain
+    transaction (PG's MVCC + row locks serialize the CAS patterns in
+    the WHERE clauses). The selector dispatches based on which backend
+    opened ``conn`` — we just defer to it. Commit on clean exit,
+    rollback on exception, never swallow.
+
+    Use for any multi-statement write (creating a task + link, claiming
+    a task + recording an event, etc.).
     """
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        yield conn
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
-    else:
-        conn.execute("COMMIT")
+    with _write_txn_via_storage(conn) as c:
+        yield c
 
 
 # ---------------------------------------------------------------------------
