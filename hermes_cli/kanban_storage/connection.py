@@ -272,22 +272,40 @@ class PgConnectionWrapper:
     def closed(self) -> bool:
         return self._conn.closed
 
-    # Allow ``with conn:`` to behave like sqlite3 (commit on success,
-    # rollback on exception). psycopg3's default is similar but the
-    # exit-with-no-error path doesn't always commit; we keep sqlite3
-    # semantics for parity with the existing code.
+    # ``with conn:`` behaviour mirrors sqlite3 for commit/rollback AND
+    # also releases the connection back to the pool on exit. The pool
+    # release is the critical part: sqlite3.Connection has no pool, so
+    # leaving __exit__ open-ended only leaks a file handle that the
+    # GC will reap. On the PG path each connection occupies a pool
+    # slot (max_size=10 by default), and not releasing on context-
+    # manager exit produces a sustained drift toward
+    # ``psycopg_pool.PoolTimeout: couldn't get a connection`` — which
+    # is exactly what the live cutover surfaced in the gateway log.
+    # Closing here matches the universal expectation that
+    # ``with kb.connect() as conn:`` doesn't leak resources.
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc, tb):
         if exc_type is None:
-            self.commit()
+            try:
+                self.commit()
+            except Exception:
+                # If the commit itself fails, don't shadow that error
+                # behind the close path — but still release the conn.
+                pass
         else:
             try:
                 self.rollback()
             except Exception:
                 pass
-        return False  # never swallow
+        try:
+            self.close()
+        except Exception:
+            # Never let cleanup raise inside __exit__; that would mask
+            # the user's original exception.
+            pass
+        return False  # never swallow the original exception
 
     # The underlying psycopg3 connection is exposed for the rare caller
     # that needs server-side cursors or COPY support (e.g. the data
@@ -295,3 +313,30 @@ class PgConnectionWrapper:
     @property
     def raw(self) -> psycopg.Connection:
         return self._conn
+
+    def __del__(self):
+        """Safety net for callers that drop the connection without close().
+
+        :mod:`sqlite3` connections close on GC; the gateway dispatcher
+        relies on that and has historically not bothered to ``with``-
+        wrap or explicitly ``close()`` the connection it gets from
+        ``_kb.connect(board=slug)``. With sqlite3 that's a harmless
+        file-handle leak the cycle collector reaps; with a pooled PG
+        connection it's a slow drift toward ``PoolTimeout``.
+
+        We mirror the sqlite3 behaviour by releasing the pool slot on
+        finalization. ``__del__`` is best-effort by design — interpreter
+        shutdown ordering can put the pool itself out of reach — so we
+        swallow every exception. Callers that want predictable cleanup
+        should still use ``with kb.connect() as conn:`` or call
+        ``conn.close()`` explicitly.
+        """
+        try:
+            if self._on_close is not None:
+                self.close()
+            elif self._conn is not None and not self._conn.closed:
+                self._conn.close()
+        except Exception:
+            # GC paths cannot raise. The pool will discard a missed
+            # connection on its next health check anyway.
+            pass
