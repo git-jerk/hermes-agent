@@ -5422,8 +5422,8 @@ def dispatch_once(
     if max_spawn is not None:
         running_count = int(
             conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
-            ).fetchone()[0]
+                "SELECT COUNT(*) AS n FROM tasks WHERE status = 'running'"
+            ).fetchone()["n"]
         )
 
     ready_rows = conn.execute(
@@ -5437,8 +5437,8 @@ def dispatch_once(
     # pile up and time out.
     if max_in_progress is not None and ready_rows:
         in_progress = conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
-        ).fetchone()[0]
+            "SELECT COUNT(*) AS n FROM tasks WHERE status = 'running'"
+        ).fetchone()["n"]
         if in_progress >= max_in_progress:
             return result
         # Only spawn enough to reach the cap, respecting max_spawn too.
