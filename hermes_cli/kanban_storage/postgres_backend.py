@@ -214,6 +214,10 @@ class PostgresBackend:
             raise
 
         wrapper = PgConnectionWrapper(raw, schema=schema)
+        # Mark the wrapper as pool-managed so __del__ knows not to
+        # double-close _conn after close() has handed it back to the
+        # pool (the pool may have already re-leased it).
+        wrapper._pool_managed = True
 
         # Hook close() so calling conn.close() returns the connection
         # to the pool rather than tearing down the socket. We also
