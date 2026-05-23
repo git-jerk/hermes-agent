@@ -9778,8 +9778,8 @@ def count_running_tasks(conn: sqlite3.Connection) -> int:
     try:
         return int(
             conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
-            ).fetchone()[0]
+                "SELECT COUNT(*) AS n FROM tasks WHERE status = 'running'"
+            ).fetchone()["n"]
         )
     except Exception:
         return 0
