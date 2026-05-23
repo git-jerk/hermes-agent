@@ -168,6 +168,7 @@ class PgConnectionWrapper:
         "_schema",
         "_returning_pending_cursor",
         "_on_close",
+        "_pool_managed",
         "row_factory",
         "_hermes_kanban_config",
     )
@@ -187,6 +188,16 @@ class PgConnectionWrapper:
         # Optional close hook for pool return (set by PostgresBackend
         # immediately after construction). Default is a no-op.
         self._on_close: Optional[Any] = None
+        # True when the underlying psycopg connection belongs to a pool.
+        # PostgresBackend.open_connection sets this together with
+        # ``_on_close``. The flag stays True even after close() clears
+        # the hook, so ``__del__`` knows not to touch ``_conn`` — by
+        # then it may have been re-handed-out by the pool to another
+        # wrapper, and a double-close would yank a live connection out
+        # from under that caller (observed as
+        # ``WARNING gateway.run: kanban notifier tick failed: the
+        # connection is closed`` right after the pool fix landed).
+        self._pool_managed: bool = False
 
     # --- core methods ---
     def execute(
@@ -333,8 +344,17 @@ class PgConnectionWrapper:
         """
         try:
             if self._on_close is not None:
+                # Pool-managed, not yet released. Run the normal close
+                # path so the pool gets the connection back.
                 self.close()
-            elif self._conn is not None and not self._conn.closed:
+            elif self._conn is not None and not self._conn.closed and not self._pool_managed:
+                # Standalone (non-pool) connection that was abandoned
+                # without close(). Mirror sqlite3's GC-driven close.
+                # For pool-managed connections we deliberately do NOT
+                # touch _conn here: close() has already returned it to
+                # the pool, and the pool may have handed it to another
+                # wrapper by the time GC runs. Closing it now would
+                # break that other caller.
                 self._conn.close()
         except Exception:
             # GC paths cannot raise. The pool will discard a missed

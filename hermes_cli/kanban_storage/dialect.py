@@ -232,6 +232,36 @@ def translate_pragma(sql: str, *, search_path_schema: Optional[str] = None) -> O
     return None
 
 
+# --- NULL-safe equality ----------------------------------------------------
+
+# SQLite extends ``=`` semantics with ``IS``: ``x IS y`` is true when both
+# are equal *or* both are NULL. Used in kanban_db.py to compare
+# ``claim_lock IS ?`` where ``?`` may be NULL (no claim) or the captured
+# lock value from a prior read. Postgres requires literal ``IS NULL`` /
+# ``IS NOT NULL`` syntax — parameterising NULL into ``IS $3`` is a
+# syntax error. The SQL-standard equivalent that takes an arbitrary
+# operand is ``IS NOT DISTINCT FROM``, which is exactly what SQLite's
+# ``IS`` semantics imply. We rewrite ``IS ?`` (placeholder-bound) to
+# ``IS NOT DISTINCT FROM ?`` here, before placeholder translation
+# converts ``?`` to ``%s``.
+
+_RE_IS_PLACEHOLDER = re.compile(r"\bIS\s+\?", re.IGNORECASE)
+_RE_IS_NOT_PLACEHOLDER = re.compile(r"\bIS\s+NOT\s+\?", re.IGNORECASE)
+
+
+def translate_is_placeholder(sql: str) -> str:
+    """Rewrite ``IS ?`` → ``IS NOT DISTINCT FROM ?`` for PG.
+
+    Leaves ``IS NULL`` / ``IS NOT NULL`` (literal NULL) untouched —
+    those are valid PG syntax. Only the placeholder form is patched.
+    Also handles ``IS NOT ?`` → ``IS DISTINCT FROM ?``.
+    """
+    # NOT-form first so the IS-only regex doesn't double-match.
+    sql = _RE_IS_NOT_PLACEHOLDER.sub("IS DISTINCT FROM ?", sql)
+    sql = _RE_IS_PLACEHOLDER.sub("IS NOT DISTINCT FROM ?", sql)
+    return sql
+
+
 # --- sqlite_master translation ---------------------------------------------
 
 # kanban_db.py probes sqlite_master twice (lines 1274, 1293) to check whether
@@ -332,6 +362,10 @@ def translate_sql_for_postgres(
     if sqm is not None:
         return sqm
     sql = translate_or_ignore(sql)
+    # NULL-safe equality (IS ?) must be rewritten before the ``?``
+    # placeholders become ``%s``, otherwise the IS-placeholder regex
+    # won't recognise the shape any more.
+    sql = translate_is_placeholder(sql)
     # OR REPLACE is intentionally not run by default — see translate_or_replace().
     sql = translate_placeholders(sql)
     return sql
