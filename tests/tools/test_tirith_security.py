@@ -634,6 +634,120 @@ class TestSpawnWarningDedup:
 
 _CFG = {"tirith_enabled": True, "tirith_path": "tirith",
         "tirith_timeout": 5, "tirith_fail_open": True}
+_CFG_TRUSTED_TAILSCALE = {
+    **_CFG,
+    "tirith_trusted_http_hosts": ["100.109.201.15", "*.ts.net", "openclaw-mini"],
+}
+
+
+class TestTrustedHttpHostSuppression:
+    """Trusted operator hosts can suppress generic HTTP/IP transport warnings."""
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_trusted_tailscale_ip_http_findings_downgraded_to_allow(self, mock_cfg, mock_run):
+        mock_cfg.return_value = _CFG_TRUSTED_TAILSCALE
+        findings = [
+            {
+                "rule_id": "raw_ip_url",
+                "severity": "medium",
+                "title": "URL uses raw IP address",
+                "description": "URL points to IP address 100.109.201.15 instead of a domain name",
+            },
+            {
+                "rule_id": "plain_http_url",
+                "severity": "high",
+                "title": "Plain HTTP URL in execution context",
+                "description": "URL http://100.109.201.15:9119/api/status uses unencrypted HTTP",
+            },
+            {
+                "rule_id": "schemeless_url_sink",
+                "severity": "medium",
+                "title": "Schemeless URL in sink context",
+                "description": "URL without explicit scheme passed to a command that downloads content",
+            },
+        ]
+        mock_run.return_value = _mock_run(2, _json_stdout(findings, "trusted transport warnings"))
+
+        result = check_command_security("curl -fsS http://100.109.201.15:9119/api/status")
+
+        assert result["action"] == "allow"
+        assert result["findings"] == []
+        assert result["summary"] == ""
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_untrusted_raw_ip_http_warning_preserved(self, mock_cfg, mock_run):
+        mock_cfg.return_value = _CFG_TRUSTED_TAILSCALE
+        findings = [{"rule_id": "raw_ip_url", "title": "URL uses raw IP address"}]
+        mock_run.return_value = _mock_run(2, _json_stdout(findings, "raw IP"))
+
+        result = check_command_security("curl http://93.184.216.34/status")
+
+        assert result["action"] == "warn"
+        assert result["findings"] == findings
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_mixed_non_transport_warning_preserved_for_trusted_host(self, mock_cfg, mock_run):
+        mock_cfg.return_value = _CFG_TRUSTED_TAILSCALE
+        findings = [
+            {"rule_id": "raw_ip_url", "title": "URL uses raw IP address"},
+            {"rule_id": "pipe_to_interpreter", "title": "Pipe to interpreter"},
+        ]
+        mock_run.return_value = _mock_run(2, _json_stdout(findings, "mixed"))
+
+        result = check_command_security(
+            "curl -fsS http://100.109.201.15:9119/api/status | python3 -m json.tool"
+        )
+
+        assert result["action"] == "warn"
+        assert result["findings"] == [{"rule_id": "pipe_to_interpreter", "title": "Pipe to interpreter"}]
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_trusted_magicdns_wildcard_downgrades_http_transport_warning(self, mock_cfg, mock_run):
+        mock_cfg.return_value = _CFG_TRUSTED_TAILSCALE
+        findings = [{"rule_id": "plain_http_url", "title": "Plain HTTP URL in execution context"}]
+        mock_run.return_value = _mock_run(2, _json_stdout(findings, "http"))
+
+        result = check_command_security("curl http://mini.tailnet-name.ts.net:9119/api/status")
+
+        assert result["action"] == "allow"
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_high_severity_transport_block_for_trusted_host_downgraded(self, mock_cfg, mock_run):
+        mock_cfg.return_value = _CFG_TRUSTED_TAILSCALE
+        findings = [{"rule_id": "plain_http_url", "title": "Plain HTTP URL in execution context"}]
+        mock_run.return_value = _mock_run(1, _json_stdout(findings, "block"))
+
+        result = check_command_security("curl http://100.109.201.15:9119/api/status")
+
+        assert result["action"] == "allow"
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_non_transport_block_for_trusted_host_never_downgraded(self, mock_cfg, mock_run):
+        mock_cfg.return_value = _CFG_TRUSTED_TAILSCALE
+        findings = [{"rule_id": "homograph_url", "title": "Homograph URL"}]
+        mock_run.return_value = _mock_run(1, _json_stdout(findings, "block"))
+
+        result = check_command_security("curl http://100.109.201.15:9119/api/status")
+
+        assert result["action"] == "block"
+        assert result["findings"] == findings
+
+
+class TestTrustedHostHelpers:
+    def test_extract_command_hosts_normalizes_ip_and_hostname(self):
+        assert _tirith_mod._extract_command_hosts(
+            "curl http://100.109.201.15:9119/a https://Mini.Tailnet.ts.net/path"
+        ) == {"100.109.201.15", "mini.tailnet.ts.net"}
+
+    def test_wildcard_match_requires_subdomain(self):
+        assert _tirith_mod._trusted_host_matches("mini.example.ts.net", "*.ts.net")
+        assert not _tirith_mod._trusted_host_matches("ts.net", "*.ts.net")
 
 
 class TestAppTldSuppression:

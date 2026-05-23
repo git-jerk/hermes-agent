@@ -480,6 +480,9 @@ terminal:
 #   approval:
 #     transport: builtin        # Or an explicitly enabled plugin transport name
 #     transport_fallback: deny  # Set builtin to opt into fallback on transport failure
+#   tirith_trusted_http_hosts:  # Optional exact hosts/IPs or *.domain patterns whose HTTP/raw-IP transport warnings are trusted (e.g. Tailscale dashboards)
+#     - 100.109.201.15
+#     - '*.ts.net'
 
 # =============================================================================
 # Browser Tool Configuration

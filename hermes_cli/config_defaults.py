@@ -2447,6 +2447,7 @@ DEFAULT_CONFIG = {
         "tirith_path": "tirith",
         "tirith_timeout": 5,
         "tirith_fail_open": True,
+        "tirith_trusted_http_hosts": [],  # Exact hosts/IPs or wildcard domains allowed to use HTTP/raw-IP transport (e.g. Tailscale dashboard)
         "website_blocklist": {
             "enabled": False,
             "domains": [],

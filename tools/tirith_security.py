@@ -21,10 +21,12 @@ never blocks.
 """
 
 import hashlib
+import ipaddress
 import json
 import logging
 import os
 import platform
+import re
 import shutil
 import stat
 import subprocess
@@ -32,6 +34,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import urllib.parse
 import urllib.request
 
 from hermes_constants import get_hermes_home
@@ -65,6 +68,25 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
+def _env_list(key: str, default: list[str]) -> list[str]:
+    """Return comma/newline-separated env list override, preserving config default."""
+    val = os.getenv(key)
+    if val is None:
+        return default
+    return [item.strip() for item in re.split(r"[,\n]", val) if item.strip()]
+
+
+def _coerce_string_list(value) -> list[str]:
+    """Normalize YAML/env scalar or list values into a compact string list."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [item.strip() for item in re.split(r"[,\n]", value) if item.strip()]
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
+
+
 def _load_security_config() -> dict:
     """Load security settings from config.yaml, with env var overrides."""
     defaults = {
@@ -72,6 +94,7 @@ def _load_security_config() -> dict:
         "tirith_path": "tirith",
         "tirith_timeout": 5,
         "tirith_fail_open": True,
+        "tirith_trusted_http_hosts": [],
     }
     try:
         from hermes_cli.config import load_config_readonly
@@ -79,11 +102,17 @@ def _load_security_config() -> dict:
     except Exception:
         cfg = {}
 
+    trusted_hosts = _coerce_string_list(cfg.get(
+        "tirith_trusted_http_hosts",
+        defaults["tirith_trusted_http_hosts"],
+    ))
+
     return {
         "tirith_enabled": _env_bool("TIRITH_ENABLED", cfg.get("tirith_enabled", defaults["tirith_enabled"])),
         "tirith_path": os.getenv("TIRITH_BIN", cfg.get("tirith_path", defaults["tirith_path"])),
         "tirith_timeout": _env_int("TIRITH_TIMEOUT", cfg.get("tirith_timeout", defaults["tirith_timeout"])),
         "tirith_fail_open": _env_bool("TIRITH_FAIL_OPEN", cfg.get("tirith_fail_open", defaults["tirith_fail_open"])),
+        "tirith_trusted_http_hosts": _env_list("TIRITH_TRUSTED_HTTP_HOSTS", trusted_hosts),
     }
 
 
@@ -727,6 +756,100 @@ def ensure_installed(*, log_failures: bool = True):
 _MAX_FINDINGS = 50
 _MAX_SUMMARY_LEN = 500
 
+_TRUSTED_HTTP_RULE_HINTS = (
+    "raw ip",
+    "raw-ip",
+    "ip address",
+    "plain http",
+    "http url",
+    "unencrypted http",
+    "schemeless url",
+    "private ip",
+)
+_URL_RE = re.compile(r"(?P<url>https?://[^\s'\"<>`)]+|(?<![\w./-])(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?(?:/[^\s'\"<>`)]*)?)")
+
+
+def _normalize_host(host: str | None) -> str:
+    """Normalize URL/IP host text for trusted-host comparisons."""
+    if not host:
+        return ""
+    host = host.strip().strip("[]").rstrip(".").lower()
+    if not host:
+        return ""
+    try:
+        return str(ipaddress.ip_address(host))
+    except ValueError:
+        return host
+
+
+def _extract_command_hosts(command: str) -> set[str]:
+    """Extract URL-like hosts from a shell command without executing it."""
+    hosts: set[str] = set()
+    for match in _URL_RE.finditer(command):
+        raw = match.group("url").rstrip(".,;:")
+        parsed = urllib.parse.urlparse(raw)
+        host = parsed.hostname
+        if not host and "://" not in raw:
+            # urlparse('100.1.2.3:9119/foo') treats the address as a scheme.
+            host = raw.split("/", 1)[0].split(":", 1)[0]
+        normalized = _normalize_host(host)
+        if normalized:
+            hosts.add(normalized)
+    return hosts
+
+
+def _trusted_host_matches(host: str, trusted_pattern: str) -> bool:
+    host = _normalize_host(host)
+    pattern = _normalize_host(trusted_pattern)
+    if not host or not pattern:
+        return False
+    if pattern.startswith("*."):
+        suffix = pattern[1:]
+        return host.endswith(suffix) and host != suffix.lstrip(".")
+    return host == pattern
+
+
+def _has_trusted_http_host(command: str, trusted_hosts: list[str]) -> bool:
+    """Return True when every URL-like command host is explicitly trusted."""
+    if not trusted_hosts:
+        return False
+    hosts = _extract_command_hosts(command)
+    if not hosts:
+        return False
+    return all(
+        any(_trusted_host_matches(host, pattern) for pattern in trusted_hosts)
+        for host in hosts
+    )
+
+
+def _is_trusted_http_host_finding(finding: dict) -> bool:
+    """Return True for Tirith HTTP/IP transport findings we may downgrade.
+
+    This intentionally covers only generic HTTP/raw-IP/schemeless-host findings.
+    It does not suppress pipe-to-interpreter, homograph, shortened URL, terminal
+    injection, or other content-execution findings even when the URL host is
+    trusted.
+    """
+    if not isinstance(finding, dict):
+        return False
+    text = " ".join(
+        str(finding.get(field, ""))
+        for field in ("rule_id", "title", "description", "message", "detail", "summary")
+    ).lower()
+    return any(hint in text for hint in _TRUSTED_HTTP_RULE_HINTS)
+
+
+def _suppress_trusted_http_host_findings(command: str, findings: list[dict], trusted_hosts: list[str]) -> list[dict]:
+    """Drop trusted tailnet/private HTTP/IP findings from security verdicts.
+
+    The trust decision is host allowlist based, not CIDR based: a CGNAT/Tailscale
+    looking address is only trusted if the operator configured that exact host or
+    wildcard hostname. Mixed findings preserve any non-HTTP/IP warning/block.
+    """
+    if not findings or not _has_trusted_http_host(command, trusted_hosts):
+        return findings
+    return [f for f in findings if not _is_trusted_http_host_finding(f)]
+
 
 def check_command_security(command: str) -> dict:
     """Run tirith security scan on a command.
@@ -839,6 +962,21 @@ def check_command_security(command: str) -> dict:
             summary = "security issue detected (details unavailable)"
         elif action == "warn":
             summary = "security warning detected (details unavailable)"
+
+    # Suppress trusted-host transport findings for operator-configured hosts (for
+    # example a Tailscale dashboard IP/hostname). This may downgrade either a
+    # warn or block verdict to allow only when every finding is a generic
+    # raw-IP/plain-HTTP/schemeless-host transport warning for an explicitly
+    # trusted host. Mixed warnings such as pipe-to-interpreter remain gated.
+    if action in {"block", "warn"} and findings:
+        findings = _suppress_trusted_http_host_findings(
+            command,
+            findings,
+            cfg.get("tirith_trusted_http_hosts") or [],
+        )
+        if not findings:
+            action = "allow"
+            summary = ""
 
     # Suppress warn verdicts that consist solely of a lookalike_tld finding for
     # the .app TLD.  .app is a legitimate gTLD used by many production services
