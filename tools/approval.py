@@ -13,6 +13,7 @@ import contextvars
 import fnmatch
 import functools
 import hashlib
+import json
 import logging
 import os
 import re
@@ -2350,6 +2351,7 @@ _pending: dict[str, dict] = {}
 _session_approved: dict[str, set] = {}
 _session_yolo: set[str] = set()
 _permanent_approved: set = set()
+_permanent_command_approved: set[str] = set()
 
 
 # =========================================================================
@@ -2957,6 +2959,100 @@ def save_permanent_allowlist(patterns: set):
         logger.warning("Could not save allowlist: %s", e)
 
 
+def _normalize_command_for_approval(command: str) -> str:
+    """Normalize a command before exact-command approval matching.
+
+    This is intentionally stricter than pattern approval but less brittle than
+    raw bytes: ANSI/control obfuscation and unicode fullwidth variants are
+    normalized by the detector, and shell whitespace runs collapse so line-wraps
+    from gateway surfaces do not defeat an otherwise identical command.
+    """
+    return " ".join(_normalize_command_for_detection(command).strip().split())
+
+
+def _exact_command_approval_key(command: str, pattern_keys: list[str] | tuple[str, ...] | set[str]) -> str:
+    """Return the durable key for an exact-command + warning-set approval."""
+    normalized_keys = sorted(str(key) for key in (pattern_keys or []) if str(key))
+    payload = {
+        "command": _normalize_command_for_approval(command),
+        "pattern_keys": normalized_keys,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def load_permanent_command_allowlist() -> set[str]:
+    """Load exact-command approvals from config and sync module state."""
+    try:
+        from hermes_cli.config import load_config
+        config = load_config()
+        entries = config.get("command_exact_allowlist", []) or []
+        keys: set[str] = set()
+        for entry in entries:
+            if isinstance(entry, str) and entry.strip():
+                keys.add(entry.strip())
+            elif isinstance(entry, dict):
+                key = str(entry.get("key") or "").strip()
+                if key:
+                    keys.add(key)
+                    continue
+                command = str(entry.get("command") or "")
+                pattern_keys = entry.get("pattern_keys") or []
+                if command and isinstance(pattern_keys, list):
+                    keys.add(_exact_command_approval_key(command, pattern_keys))
+        if keys:
+            with _lock:
+                _permanent_command_approved.update(keys)
+        return keys
+    except Exception as e:
+        logger.warning("Failed to load exact command allowlist: %s", e)
+        return set()
+
+
+def is_command_permanently_approved(command: str, pattern_keys: list[str]) -> bool:
+    """Check exact-command durable approvals for this command + warning set."""
+    key = _exact_command_approval_key(command, pattern_keys)
+    with _lock:
+        if key in _permanent_command_approved:
+            return True
+    # Config can be edited while the gateway is running. Refresh lazily so a
+    # durable approval written by another process/session takes effect without
+    # a restart.
+    load_permanent_command_allowlist()
+    with _lock:
+        return key in _permanent_command_approved
+
+
+def approve_command_permanent(command: str, pattern_keys: list[str]) -> None:
+    """Persist exact approval for one normalized command and warning set."""
+    normalized_command = _normalize_command_for_approval(command)
+    normalized_keys = sorted(str(key) for key in (pattern_keys or []) if str(key))
+    key = _exact_command_approval_key(normalized_command, normalized_keys)
+    with _lock:
+        _permanent_command_approved.add(key)
+    try:
+        from hermes_cli.config import load_config, save_config
+        config = load_config()
+        entries = list(config.get("command_exact_allowlist", []) or [])
+        existing_keys = set()
+        for entry in entries:
+            if isinstance(entry, str):
+                existing_keys.add(entry)
+            elif isinstance(entry, dict):
+                existing_keys.add(str(entry.get("key") or ""))
+        if key not in existing_keys:
+            entries.append({
+                "key": key,
+                "command": normalized_command,
+                "pattern_keys": normalized_keys,
+                "created_at": time.time(),
+            })
+            config["command_exact_allowlist"] = entries
+            save_config(config)
+    except Exception as e:
+        logger.warning("Could not save exact command allowlist: %s", e)
+
+
 # =========================================================================
 # Approval prompting + orchestration
 # =========================================================================
@@ -2969,9 +3065,9 @@ def prompt_dangerous_approval(command: str, description: str,
     """Prompt the user to approve a dangerous command (CLI only).
 
     Args:
-        allow_permanent: When False, hide the [a]lways option (used when
-            tirith warnings are present, since broad permanent allowlisting
-            is inappropriate for content-level security findings).
+        allow_permanent: When False, hide the [a]lways option.  When offered,
+            "always" persists only the exact normalized command and warning
+            set; legacy broad pattern entries remain read-compatible only.
         smart_denied: When True, this is an owner override of a Smart DENY.
             Offer only one-operation approval or denial.
         approval_callback: Optional callback registered by the CLI for
@@ -4622,6 +4718,15 @@ def check_all_command_guards(command: str, env_type: str,
     if not warnings:
         return {"approved": True, "message": None}
 
+    # Permanent approval is never offered for Tirith content-security findings.
+    has_tirith = any(is_tirith for _, _, is_tirith in warnings)
+    candidate_keys = [key for key, _, _ in warnings]
+    if is_command_permanently_approved(command, candidate_keys):
+        # Exact durable approvals must not broaden into a session-level pattern
+        # approval, or a later different command with the same warning key would
+        # skip its prompt in this session.
+        return {"approved": True, "message": None, "exact_approved": True}
+
     # --- Phase 2.5: Smart approval (auxiliary LLM risk assessment) ---
     # When approvals.mode=smart, ask the aux LLM before prompting the user.
     # Inspired by OpenAI Codex's Smart Approvals guardian subagent
@@ -4730,15 +4835,11 @@ def check_all_command_guards(command: str, env_type: str,
                     "user_consent": False,
                 }
             if not smart_denied_for_owner:
-                for key, _, is_tirith in warnings:
-                    if transport_choice == "session" or (
-                        transport_choice == "always" and is_tirith
-                    ):
+                for key, _, _ in warnings:
+                    if transport_choice in {"session", "always"}:
                         approve_session(session_key, key)
-                    elif transport_choice == "always":
-                        approve_session(session_key, key)
-                        approve_permanent(key)
-                        save_permanent_allowlist(_permanent_approved)
+                if transport_choice == "always" and not has_tirith:
+                    approve_command_permanent(command, all_keys)
             _reset_denials(session_key)
             return {
                 "approved": True,
@@ -4840,17 +4941,15 @@ def check_all_command_guards(command: str, env_type: str,
                     "deny_reason": deny_reason,
                 }
 
-            # A smart-DENY owner override is always one operation, even if an
-            # older client returns "session" or "always". Manual and ESCALATE
-            # choices retain their existing persistence semantics.
+            # Smart-DENY owner overrides remain one-operation only.  Other
+            # "always" approvals persist only this normalized command + warning
+            # set, never a broad detector pattern.
             if not smart_denied_for_owner:
-                for key, _, is_tirith in warnings:
-                    if choice == "session" or (choice == "always" and is_tirith):
+                for key, _, _ in warnings:
+                    if choice in {"session", "always"}:
                         approve_session(session_key, key)
-                    elif choice == "always":
-                        approve_session(session_key, key)
-                        approve_permanent(key)
-                        save_permanent_allowlist(_permanent_approved)
+                if choice == "always" and not has_tirith:
+                    approve_command_permanent(command, all_keys)
 
             # A human approval (including an ESCALATE-then-approve or a
             # smart-DENY owner override) resets the consecutive-denial tally.
@@ -4902,8 +5001,10 @@ def check_all_command_guards(command: str, env_type: str,
                 result.update(smart_denied=True, allow_permanent=False)
             return result
 
-    # CLI interactive: single combined prompt
-    # Hide [a]lways when no persistable (non-tirith) warning is present
+    # CLI interactive: single combined prompt.  Hide [a]lways when no
+    # persistable (non-tirith) warning is present; when shown, "always" is
+    # exact-command scoped (fork), while Tirith and Smart-DENY retain
+    # upstream's strict no-permanent scope.
     _fire_approval_hook(
         "pre_approval_request",
         command=command,
@@ -4968,18 +5069,15 @@ def check_all_command_guards(command: str, env_type: str,
             "user_consent": False,
         }
 
-    # Smart-DENY owner overrides are one-operation scoped. Preserve existing
-    # persistence for manual mode and smart ESCALATE.
+    # Smart-DENY owner overrides are one-operation scoped.  For ordinary
+    # approvals, persist the session scope and make "always" exact-command
+    # durable only when the stricter Tirith gate permits it.
     if not smart_denied_for_owner:
-        for key, _, is_tirith in warnings:
-            if choice == "session" or (choice == "always" and is_tirith):
-                # tirith: session only (no permanent broad allowlisting)
+        for key, _, _ in warnings:
+            if choice in {"session", "always"}:
                 approve_session(session_key, key)
-            elif choice == "always":
-                # dangerous patterns: permanent allowed
-                approve_session(session_key, key)
-                approve_permanent(key)
-                save_permanent_allowlist(_permanent_approved)
+        if choice == "always" and not has_tirith:
+            approve_command_permanent(command, all_keys)
 
     # A human approval resets the consecutive-denial tally.
     _reset_denials(session_key)
@@ -5100,6 +5198,8 @@ def check_execute_code_guard(code: str, env_type: str,
     # consulted, so every execute_code call re-prompts the user (#39275).
     if is_approved(session_key, pattern_key):
         return {"approved": True, "message": None}
+    if is_command_permanently_approved(command, [pattern_key]):
+        return {"approved": True, "message": None, "exact_approved": True}
 
     # Smart mode: ask the aux LLM about the whole script. An APPROVE here only
     # suppresses the redundant whole-script prompt; the per-call terminal()
@@ -5199,8 +5299,7 @@ def check_execute_code_guard(code: str, env_type: str,
                     approve_session(session_key, pattern_key)
                 elif choice == "always":
                     approve_session(session_key, pattern_key)
-                    approve_permanent(pattern_key)
-                    save_permanent_allowlist(_permanent_approved)
+                    approve_command_permanent(command, [pattern_key])
             _reset_denials(session_key)
             return {
                 "approved": True,
@@ -5294,8 +5393,7 @@ def check_execute_code_guard(code: str, env_type: str,
                     approve_session(session_key, pattern_key)
                 elif choice == "always":
                     approve_session(session_key, pattern_key)
-                    approve_permanent(pattern_key)
-                    save_permanent_allowlist(_permanent_approved)
+                    approve_command_permanent(command, [pattern_key])
             _reset_denials(session_key)
             return {
                 "approved": True,
@@ -5393,8 +5491,7 @@ def check_execute_code_guard(code: str, env_type: str,
             approve_session(session_key, pattern_key)
         elif choice == "always":
             approve_session(session_key, pattern_key)
-            approve_permanent(pattern_key)
-            save_permanent_allowlist(_permanent_approved)
+            approve_command_permanent(command, [pattern_key])
     # choice == "once": no persistence — approval lasts this single call only.
 
     # A human approval resets the consecutive-denial tally.
@@ -5496,3 +5593,4 @@ def request_elicitation_consent(
 
 # Load permanent allowlist from config on module import
 load_permanent_allowlist()
+load_permanent_command_allowlist()

@@ -297,6 +297,40 @@ def test_cli_selected_transport_replaces_builtin_prompt(monkeypatch):
     assert seen[0].allowed_choices == ("once", "session", "always", "deny")
 
 
+def test_selected_transport_always_persists_exact_command_not_pattern(monkeypatch):
+    from tools import approval
+
+    manager = PluginManager()
+    choices = iter(("always", "deny"))
+    seen = []
+    _context(manager).register_approval_transport(
+        "phone",
+        lambda request: seen.append(request) or request.respond(next(choices)),
+    )
+    _configure_manual_guard(monkeypatch, approval, manager)
+    cfg = {"approvals": {"mode": "manual"}, "command_allowlist": []}
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr("hermes_cli.config.save_config", lambda new_cfg: cfg.update(new_cfg))
+    approval._session_approved.clear()
+    approval._permanent_approved.clear()
+    if hasattr(approval, "_permanent_command_approved"):
+        approval._permanent_command_approved.clear()
+
+    first = approval.check_all_command_guards("rm -rf /tmp/example", "local")
+    approval._session_approved.clear()
+    same = approval.check_all_command_guards("rm -rf /tmp/example", "local")
+    different = approval.check_all_command_guards("rm -rf /tmp/other", "local")
+
+    assert first["approved"] is True
+    assert same["approved"] is True
+    assert same.get("exact_approved") is True
+    assert different["approved"] is False
+    assert approval._permanent_approved == set()
+    assert cfg.get("command_allowlist") == []
+    assert cfg.get("command_exact_allowlist")
+    assert len(seen) == 2
+
+
 def test_gateway_selected_transport_does_not_require_gateway_notifier(monkeypatch):
     from tools import approval
 
@@ -344,6 +378,54 @@ def test_execute_code_gateway_uses_selected_transport(monkeypatch):
     assert len(seen) == 1
     assert seen[0].pattern_key == "execute_code"
     assert seen[0].surface == "gateway"
+
+
+def test_execute_code_selected_transport_always_persists_exact_script(monkeypatch):
+    from tools import approval
+
+    manager = PluginManager()
+    choices = iter(("always", "deny"))
+    seen = []
+    _context(manager).register_approval_transport(
+        "phone",
+        lambda request: seen.append(request) or request.respond(next(choices)),
+    )
+    cfg = {"approvals": {"mode": "manual"}, "command_allowlist": []}
+    monkeypatch.setattr(approval, "_get_approval_mode", lambda: "manual")
+    monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
+    monkeypatch.setattr(approval, "_is_cron_approval_context", lambda: False)
+    monkeypatch.setattr(approval, "_is_single_query_approval_context", lambda: False)
+    monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
+    monkeypatch.setattr(approval, "_get_approval_timeout", lambda: 1)
+    monkeypatch.setattr(
+        approval, "get_current_session_key", lambda *args, **kwargs: "session-a"
+    )
+    monkeypatch.setattr(approval, "get_plugin_manager", lambda: manager)
+    monkeypatch.setattr(
+        approval, "_get_approval_transport_config", lambda: ("phone", None)
+    )
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        "hermes_cli.config.save_config", lambda new_cfg: cfg.update(new_cfg)
+    )
+    approval._session_approved.clear()
+    approval._permanent_approved.clear()
+    if hasattr(approval, "_permanent_command_approved"):
+        approval._permanent_command_approved.clear()
+
+    first = approval.check_execute_code_guard("print('ok')", "local")
+    approval._session_approved.clear()
+    same = approval.check_execute_code_guard("print('ok')", "local")
+    different = approval.check_execute_code_guard("print('changed')", "local")
+
+    assert first["approved"] is True
+    assert same["approved"] is True
+    assert same.get("exact_approved") is True
+    assert different["approved"] is False
+    assert approval._permanent_approved == set()
+    assert cfg.get("command_allowlist") == []
+    assert cfg.get("command_exact_allowlist")
+    assert len(seen) == 2
 
 
 def test_transport_failure_denies_without_builtin_fallback(monkeypatch):

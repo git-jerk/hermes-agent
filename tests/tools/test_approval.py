@@ -16,6 +16,7 @@ from tools.approval import (
     _normalize_approval_mode,
     _smart_approve,
     approve_session,
+    check_all_command_guards,
     detect_dangerous_command,
     detect_hardline_command,
     is_approved,
@@ -1782,3 +1783,121 @@ class TestCliApprovalTimeoutClassifiedSeparately:
         assert result.get("user_consent") is False
         assert "timed out without user response" in result["message"]
         assert "Silence is not consent" in result["message"]
+
+
+class TestApproveAlwaysExactCommandPersistence:
+    """Regression tests for the human meaning of `/approve always`."""
+
+    def setup_method(self):
+        from tools import approval as mod
+        mod._session_approved.clear()
+        mod._session_yolo.clear()
+        mod._permanent_approved.clear()
+        mod._pending.clear()
+        mod._gateway_queues.clear()
+        mod._gateway_notify_cbs.clear()
+        if hasattr(mod, "_permanent_command_approved"):
+            mod._permanent_command_approved.clear()
+
+    def test_always_persists_exact_command_without_broad_pattern_allowlist(self, monkeypatch):
+        """`always` should not make every future command with the same regex safe."""
+        from tools import approval as mod
+
+        cfg = {"approvals": {"mode": "manual"}, "command_allowlist": []}
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+        monkeypatch.setattr("hermes_cli.config.save_config", lambda new_cfg: cfg.update(new_cfg))
+        monkeypatch.setattr(
+            mod,
+            "_fire_approval_hook",
+            lambda *args, **kwargs: None,
+        )
+        monkeypatch.setattr(
+            "tools.tirith_security.check_command_security",
+            lambda command: {"action": "allow", "findings": [], "summary": ""},
+        )
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+
+        token = mod.set_current_session_key("approve-always-first")
+        try:
+            first = check_all_command_guards(
+                "python -c 'print(1)'",
+                "local",
+                approval_callback=lambda *args, **kwargs: "always",
+            )
+        finally:
+            mod.reset_current_session_key(token)
+
+        assert first["approved"] is True
+        assert cfg.get("command_allowlist") == []
+        assert cfg.get("command_exact_allowlist"), "always should persist an exact command approval"
+
+        mod._session_approved.clear()
+        token = mod.set_current_session_key("approve-always-next-session")
+        try:
+            same = check_all_command_guards(
+                "python -c 'print(1)'",
+                "local",
+                approval_callback=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("same exact command should not prompt")),
+            )
+            different = check_all_command_guards(
+                "python -c 'print(2)'",
+                "local",
+                approval_callback=lambda *args, **kwargs: "deny",
+            )
+        finally:
+            mod.reset_current_session_key(token)
+
+        assert same["approved"] is True
+        assert different["approved"] is False
+
+    def test_tirith_warning_never_persists_exact_command_approval(self, monkeypatch):
+        """Content-security warnings remain one-session only despite an always reply."""
+        from tools import approval as mod
+
+        cfg = {"approvals": {"mode": "manual"}, "command_allowlist": []}
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+        monkeypatch.setattr("hermes_cli.config.save_config", lambda new_cfg: cfg.update(new_cfg))
+        monkeypatch.setattr(mod, "_fire_approval_hook", lambda *args, **kwargs: None)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+
+        tirith_warn = {
+            "action": "warn",
+            "findings": [{"rule_id": "test.rule", "severity": "medium", "title": "Test", "description": "test warning"}],
+            "summary": "test warning",
+        }
+        with mock_patch("tools.tirith_security.check_command_security", return_value=tirith_warn):
+            token = mod.set_current_session_key("tirith-first")
+            try:
+                first = check_all_command_guards(
+                    "echo safe",
+                    "local",
+                    approval_callback=lambda *args, **kwargs: "always",
+                )
+            finally:
+                mod.reset_current_session_key(token)
+
+            assert first["approved"] is True
+            assert not cfg.get("command_exact_allowlist")
+
+            mod._session_approved.clear()
+            token = mod.set_current_session_key("tirith-next-session")
+            try:
+                same = check_all_command_guards(
+                    "echo safe",
+                    "local",
+                    approval_callback=lambda *args, **kwargs: "deny",
+                )
+                different = check_all_command_guards(
+                    "echo different",
+                    "local",
+                    approval_callback=lambda *args, **kwargs: "deny",
+                )
+            finally:
+                mod.reset_current_session_key(token)
+
+        assert same["approved"] is False
+        assert different["approved"] is False

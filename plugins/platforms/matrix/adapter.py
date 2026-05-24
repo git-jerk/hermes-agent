@@ -1343,6 +1343,7 @@ class MatrixAdapter(BasePlatformAdapter):
         self._approval_reaction_map = {
             "✅": "once",
             "🌀": "session",
+            "🔁": "always",
             "♾️": "always",
             "♾": "always",
             "\u267e\ufe0f": "always",
@@ -2673,7 +2674,7 @@ class MatrixAdapter(BasePlatformAdapter):
         if allow_session:
             reaction_legend_parts.append("🌀 = approve for this session")
             if allow_permanent:
-                reaction_legend_parts.append("♾️ = approve always")
+                reaction_legend_parts.append("♾️ = approve always (exact command)")
         reaction_legend_parts.append("❎ = deny")
         text = (
             f"{self._format_exec_approval(command, description)}\n\n"
