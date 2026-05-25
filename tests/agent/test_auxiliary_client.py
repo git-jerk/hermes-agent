@@ -1448,6 +1448,29 @@ class TestRefreshNousRecommendedModel:
         assert out is None
 
 
+class TestIsProviderCapacityError:
+    """_is_provider_capacity_error detects transient provider capacity failures."""
+
+    def test_gemini_503_high_demand_is_capacity_error(self):
+        from agent import auxiliary_client as aux
+
+        exc = Exception(
+            "Gemini HTTP 503 (UNAVAILABLE): This model is currently experiencing "
+            "high demand. Spikes in demand are usually temporary. Please try again later."
+        )
+        exc.status_code = 503
+
+        assert aux._is_provider_capacity_error(exc) is True
+
+    def test_generic_500_is_not_capacity_error(self):
+        from agent import auxiliary_client as aux
+
+        exc = Exception("Internal server error")
+        exc.status_code = 500
+
+        assert aux._is_provider_capacity_error(exc) is False
+
+
 class TestIsRateLimitError:
     """_is_rate_limit_error detects 429 rate-limit errors warranting fallback."""
 
@@ -1758,6 +1781,193 @@ class TestAuxiliaryFallbackLayering:
 
 
 
+    def test_invalid_empty_choices_response_triggers_fallback(self, monkeypatch):
+        """HTTP-200 malformed chat completions should not abort aux fallback."""
+        primary_client = MagicMock()
+        primary_client.chat.completions.create.return_value = MagicMock(choices=[])
+
+        fallback_client = MagicMock()
+        fallback_client.chat.completions.create.return_value = MagicMock(choices=[
+            MagicMock(message=MagicMock(content="from fallback chain"))
+        ])
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "minimaxai/minimax-m3")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("nvidia", "minimaxai/minimax-m3", None, None, None)), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(fallback_client, "gpt-5.4-mini", "fallback_chain[0](openai-codex)")) as mock_chain, \
+             patch("agent.auxiliary_client._try_main_agent_model_fallback") as mock_main:
+            result = call_llm(
+                task="title_generation",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert result.choices[0].message.content == "from fallback chain"
+        mock_chain.assert_called_once_with(
+            "title_generation",
+            "nvidia",
+            reason="invalid provider response",
+        )
+        mock_main.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_async_invalid_empty_choices_response_triggers_fallback(self, monkeypatch):
+        """Async aux calls use the same malformed-response fallback path."""
+        primary_client = MagicMock()
+        primary_client.chat.completions.create = AsyncMock(return_value=MagicMock(choices=[]))
+
+        fallback_client = MagicMock()
+        async_fallback_client = MagicMock()
+        async_fallback_client.chat.completions.create = AsyncMock(return_value=MagicMock(choices=[
+            MagicMock(message=MagicMock(content="from async fallback"))
+        ]))
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "minimaxai/minimax-m3")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("nvidia", "minimaxai/minimax-m3", None, None, None)), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(fallback_client, "gpt-5.4-mini", "fallback_chain[0](openai-codex)")) as mock_chain, \
+             patch("agent.auxiliary_client._to_async_client",
+                   return_value=(async_fallback_client, "gpt-5.4-mini")):
+            result = await async_call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert result.choices[0].message.content == "from async fallback"
+        mock_chain.assert_called_once_with(
+            "compression",
+            "nvidia",
+            reason="invalid provider response",
+        )
+
+    def test_auto_provider_uses_task_then_main_chain_before_builtin_chain(self, monkeypatch):
+        """Auto aux call failures try per-task then top-level fallback before built-ins."""
+        primary_client = MagicMock()
+        primary_client.chat.completions.create.side_effect = self._make_payment_err()
+
+        main_chain_client = MagicMock()
+        main_chain_client.chat.completions.create.return_value = MagicMock(choices=[
+            MagicMock(message=MagicMock(content="from main fallback chain"))
+        ])
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "qwen/qwen3.5-122b-a10b")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("auto", None, None, None, None)), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(None, None, "")) as mock_task_chain, \
+             patch("agent.auxiliary_client._try_main_fallback_chain",
+                   return_value=(main_chain_client, "inclusionai/ring-2.6-1t:free", "openrouter")) as mock_main_chain, \
+             patch("agent.auxiliary_client._try_payment_fallback") as mock_builtin_chain:
+            result = call_llm(
+                task="title_generation",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert main_chain_client.chat.completions.create.called
+        mock_task_chain.assert_called_once_with(
+            "title_generation", "auto", reason="payment error")
+        mock_main_chain.assert_called_once_with(
+            "title_generation", "auto", reason="payment error")
+        mock_builtin_chain.assert_not_called()
+    def _make_provider_capacity_err(self):
+        exc = Exception(
+            "Gemini HTTP 503 (UNAVAILABLE): This model is currently experiencing "
+            "high demand. Spikes in demand are usually temporary. Please try again later."
+        )
+        exc.status_code = 503
+        return exc
+
+    def test_explicit_provider_capacity_uses_configured_chain_first(self, monkeypatch):
+        """Provider-overloaded 503s should bypass the explicit-provider gate."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+
+        primary_client = MagicMock()
+        primary_client.chat.completions.create.side_effect = self._make_provider_capacity_err()
+
+        chain_client = MagicMock()
+        chain_client.chat.completions.create.return_value = MagicMock(choices=[
+            MagicMock(message=MagicMock(content="from configured chain"))
+        ])
+
+        main_called = MagicMock()
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "gemini-3-flash-preview")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("gemini", "gemini-3-flash-preview", None, None, None)), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(chain_client, "gpt-4o-mini", "fallback_chain[0](openai)")), \
+             patch("agent.auxiliary_client._try_main_agent_model_fallback",
+                   side_effect=main_called):
+            call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert chain_client.chat.completions.create.called
+        main_called.assert_not_called()
+
+    def test_explicit_provider_uses_configured_chain_first(self, monkeypatch, caplog):
+        """When a user has fallback_chain configured, it's tried BEFORE the main agent model."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+
+        primary_client = MagicMock()
+        primary_client.chat.completions.create.side_effect = self._make_payment_err()
+
+        chain_client = MagicMock()
+        chain_client.chat.completions.create.return_value = MagicMock(choices=[
+            MagicMock(message=MagicMock(content="from configured chain"))
+        ])
+
+        main_called = MagicMock()
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "glm-4v-flash")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("glm", "glm-4v-flash", None, None, None)), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(chain_client, "gpt-4o-mini", "fallback_chain[0](openai)")), \
+             patch("agent.auxiliary_client._try_main_agent_model_fallback",
+                   side_effect=main_called):
+            result = call_llm(
+                task="vision",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert chain_client.chat.completions.create.called
+        # Main agent fallback should NOT have been consulted — chain succeeded first
+        main_called.assert_not_called()
+
+    def test_explicit_provider_falls_back_to_main_when_chain_exhausted(self, monkeypatch):
+        """If configured fallback_chain returns nothing, main agent model is tried next."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+
+        primary_client = MagicMock()
+        primary_client.chat.completions.create.side_effect = self._make_payment_err()
+
+        main_client = MagicMock()
+        main_client.chat.completions.create.return_value = MagicMock(choices=[
+            MagicMock(message=MagicMock(content="from main agent"))
+        ])
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "glm-4v-flash")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("glm", "glm-4v-flash", None, None, None)), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(None, None, "")), \
+             patch("agent.auxiliary_client._try_main_agent_model_fallback",
+                   return_value=(main_client, "claude-sonnet-4", "main-agent(openrouter)")):
+            result = call_llm(
+                task="vision",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert main_client.chat.completions.create.called
 
     def test_explicit_provider_rate_limit_triggers_fallback(self, monkeypatch):
         """429 rate-limit on an explicit provider must trigger fallback (not be ignored).

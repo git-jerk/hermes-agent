@@ -4185,6 +4185,34 @@ def _nous_portal_account_has_fresh_paid_access() -> bool:
         return False
 
 
+def _is_provider_capacity_error(exc: Exception) -> bool:
+    """Detect transient provider capacity failures that warrant fallback.
+
+    These are reachable API responses (unlike connection errors) but still mean
+    the selected provider/model cannot serve the request right now.  Gemini can
+    return HTTP 503 with "high demand" for large compression jobs even when
+    smaller smoke tests pass, so route these through the same auxiliary fallback
+    layers instead of aborting compaction immediately.
+    """
+    status = getattr(exc, "status_code", None)
+    err_lower = str(exc).lower()
+    has_capacity_status = (
+        status in {503, 529}
+        or "http 503" in err_lower
+        or "http 529" in err_lower
+    )
+    if not has_capacity_status:
+        return False
+    return any(kw in err_lower for kw in (
+        "unavailable",
+        "high demand",
+        "try again later",
+        "temporarily unavailable",
+        "capacity",
+        "overloaded",
+    ))
+
+
 def _is_rate_limit_error(exc: Exception) -> bool:
     """Detect rate-limit errors that warrant provider fallback.
 
@@ -9932,11 +9960,13 @@ def _call_llm_impl(
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            or _is_provider_capacity_error(first_err)
         )
         # Respect explicit provider choice for transient errors (auth, request
         # validation, etc.) but allow fallback when the provider clearly cannot
-        # serve the request due to capacity: payment/quota exhaustion and
-        # connection failures are capacity problems, not request constraints.
+        # serve the request due to capacity: payment/quota exhaustion,
+        # connection failures, and provider-overloaded 503/529 responses are
+        # capacity problems, not request constraints.
         # See #26803: daily token quota (429 + "too many tokens per day") must
         # fall back just like a 402 credit error.
         is_auto = resolved_provider in {"auto", "", None}
@@ -9955,6 +9985,7 @@ def _call_llm_impl(
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            or _is_provider_capacity_error(first_err)
         )
         if should_fallback and (is_auto or is_capacity_error):
             if _is_auth_error(first_err):
@@ -9974,6 +10005,8 @@ def _call_llm_impl(
                 reason = "model incompatible with route"
             elif _is_invalid_aux_response_error(first_err):
                 reason = "invalid provider response"
+            elif _is_provider_capacity_error(first_err):
+                reason = "provider capacity"
             else:
                 reason = "connection error"
             logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
@@ -10657,6 +10690,7 @@ async def _async_call_llm_impl(
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            or _is_provider_capacity_error(first_err)
         )
         if should_fallback and (is_auto or is_capacity_error):
             if _is_auth_error(first_err):
@@ -10672,6 +10706,8 @@ async def _async_call_llm_impl(
                 reason = "model incompatible with route"
             elif _is_invalid_aux_response_error(first_err):
                 reason = "invalid provider response"
+            elif _is_provider_capacity_error(first_err):
+                reason = "provider capacity"
             else:
                 reason = "connection error"
             logger.info("Auxiliary %s (async): %s on %s (%s), trying fallback",
