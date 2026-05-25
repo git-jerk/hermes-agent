@@ -12080,12 +12080,25 @@ def list_profiles_on_disk() -> list[str]:
     return sorted(names)
 
 
+def list_configured_external_assignees() -> list[str]:
+    """Return configured non-profile Kanban lanes that can spawn workers."""
+    names: set[str] = set()
+    try:
+        from hermes_cli import kanban_claude_code
+
+        names.update(kanban_claude_code.configured_assignees())
+    except Exception:
+        pass
+    return sorted(name for name in names if name)
+
+
 def known_assignees(conn: sqlite3.Connection) -> list[dict]:
-    """Return every assignee name known to the board or on disk.
+    """Return every assignee name known to the board, config, or disk.
 
     Each entry is ``{"name": str, "on_disk": bool, "counts": {status: n}}``.
-    A name is included when it's a configured profile on disk OR when
-    any non-archived task has it as the assignee. Used by:
+    A name is included when it's a configured profile on disk, a configured
+    external worker lane (for example Claude Code ``--bg``), OR when any
+    non-archived task has it as the assignee. Used by:
 
     - ``hermes kanban assignees`` for the terminal.
     - The dashboard assignee dropdown (so a fresh profile appears in
@@ -12094,6 +12107,7 @@ def known_assignees(conn: sqlite3.Connection) -> list[dict]:
       the whole board.
     """
     on_disk = set(list_profiles_on_disk())
+    external = set(list_configured_external_assignees())
 
     # Count tasks per (assignee, status), excluding archived.
     counts: dict[str, dict[str, int]] = {}
@@ -12104,7 +12118,7 @@ def known_assignees(conn: sqlite3.Connection) -> list[dict]:
     ):
         counts.setdefault(row["assignee"], {})[row["status"]] = int(row["n"])
 
-    names = sorted(on_disk | set(counts.keys()))
+    names = sorted(on_disk | external | set(counts.keys()))
     return [
         {
             "name": name,

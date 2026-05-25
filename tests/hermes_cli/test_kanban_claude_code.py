@@ -21,6 +21,22 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
+def test_known_assignees_include_configured_claude_code_lanes(kanban_home, monkeypatch):
+    monkeypatch.setattr(
+        kcc,
+        "configured_assignees",
+        lambda config=None: {"claude-code", "claude-review"},
+    )
+
+    with kb.connect() as conn:
+        names = {entry["name"]: entry for entry in kb.known_assignees(conn)}
+
+    assert "claude-code" in names
+    assert "claude-review" in names
+    assert names["claude-review"]["on_disk"] is False
+    assert names["claude-review"]["counts"] == {}
+
+
 def test_parse_claude_bg_session_id_from_current_cli_output():
     output = """Starting background service…
 backgrounded · 0f40b52b
