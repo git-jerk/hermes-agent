@@ -2649,7 +2649,8 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             # enabled=True means the user wrote it themselves or another
             # env-var bridge enabled it — keep that decision).
             if existing_cfg is None or not existing_cfg.enabled:
-                if entry.is_connected is not None:
+                is_connected = getattr(entry, "is_connected", None)
+                if is_connected is not None:
                     try:
                         # Probe with ``enabled=True`` since we're asking
                         # "would this plugin BE configured if we enabled
@@ -2680,7 +2681,7 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                                 enabled=True,
                                 extra=probe_extra,
                             )
-                        configured = bool(entry.is_connected(probe_cfg))
+                        configured = bool(is_connected(probe_cfg))
                     except Exception as exc:
                         logger.debug(
                             "is_connected for %s raised: %s — skipping enablement",
