@@ -115,7 +115,12 @@ class SqliteBackend:
         except ImportError:
             pass
         resolved = str(path.resolve())
-        conn = sqlite3.connect(str(path), isolation_level=None, timeout=30)
+        try:
+            from hermes_cli.kanban_db import _sqlite_connect
+
+            conn = _sqlite_connect(path)
+        except ImportError:
+            conn = sqlite3.connect(str(path), isolation_level=None, timeout=30)
         try:
             conn.row_factory = sqlite3.Row
             with _INIT_LOCK:
