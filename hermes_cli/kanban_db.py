@@ -2004,6 +2004,10 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
     Writes are confined to the original DB's parent directory. The backup
     basename is derived purely from ``path.name`` and a content hash, never
     from caller-supplied directory segments — no traversal is possible.
+
+    If the same unchanged corrupt DB is probed repeatedly by long-running
+    dispatchers or cron jobs, reuse the existing content-addressed backup
+    instead of producing unbounded duplicate ``.corrupt.*.bak`` files.
     """
     # Resolve once and pin the parent so subsequent path operations cannot
     # escape it. ``Path.resolve()`` collapses any ``..`` segments and

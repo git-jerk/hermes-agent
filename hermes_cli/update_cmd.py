@@ -5736,8 +5736,33 @@ def _cmd_update_impl(args, gateway_mode: bool):
             )
             if pull_result.returncode != 0:
                 # ff-only failed — local and remote have diverged (e.g. upstream
-                # force-pushed or rebase).  Since local changes are already
-                # stashed, reset to match the remote exactly.
+                # force-pushed or rebase, OR local fork commits exist).
+                # LOCAL HARDENING 2026-05-28 (carried across the update_cmd
+                # refactor): do NOT silently hard-reset when local commits
+                # exist; that wipes local fork patches (e.g. the
+                # kanban_storage Postgres backend). Require explicit override.
+                ahead_result = subprocess.run(
+                    git_cmd + ["rev-list", "--count", f"origin/{branch}..HEAD"],
+                    cwd=_m().PROJECT_ROOT, capture_output=True, text=True,
+                )
+                ahead = (ahead_result.stdout or "0").strip()
+                if ahead and ahead != "0" and not os.environ.get("HERMES_UPDATE_FORCE_RESET"):
+                    print(
+                        f"  ✗ Local has {ahead} commit(s) ahead of origin/{branch}; refusing to hard-reset."
+                    )
+                    print(
+                        "    Local commits would be discarded. To override:"
+                    )
+                    print(
+                        f"      HERMES_UPDATE_FORCE_RESET=1 hermes update"
+                    )
+                    print(
+                        "    Or rebase your fork manually:"
+                    )
+                    print(
+                        f"      git fetch origin && git rebase origin/{branch}"
+                    )
+                    sys.exit(1)
                 print(
                     "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
                 )

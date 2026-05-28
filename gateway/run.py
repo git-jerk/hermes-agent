@@ -2158,6 +2158,13 @@ def _bridge_max_turns_from_config(home: "Path") -> None:
         if "search_slow_ms" in sessions_cfg:
             os.environ["HERMES_SEARCH_SLOW_MS"] = str(sessions_cfg["search_slow_ms"])
 
+    matrix_cfg = cfg.get("matrix", {})
+    if isinstance(matrix_cfg, dict) and "max_turns" in matrix_cfg:
+        try:
+            os.environ["HERMES_MAX_ITERATIONS_MATRIX"] = str(int(matrix_cfg["max_turns"]))
+        except (TypeError, ValueError):
+            pass
+
 
 def _current_max_iterations() -> int:
     """Return the current per-turn iteration budget after runtime env refresh.
@@ -5391,6 +5398,16 @@ class TurnRunner:
             combined_ephemeral = (combined_ephemeral + "\n\n" + cfg_channel_prompt).strip()
 
         max_iterations = _current_max_iterations()
+        # Carried fork behavior: honor HERMES_MAX_ITERATIONS_<PLATFORM>
+        # (bridged from config.yaml, e.g. matrix.max_turns) on the TurnRunner
+        # path too, matching the session-runtime resolution sites.
+        _plat = ctx.source.platform.value if ctx.source.platform else ""
+        _override = os.getenv(f"HERMES_MAX_ITERATIONS_{_plat.upper()}") if _plat else None
+        if _override:
+            try:
+                max_iterations = int(_override)
+            except ValueError:
+                pass
 
         try:
             model, runtime_kwargs = self._runner._resolve_session_agent_runtime(
@@ -22477,6 +22494,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             pr = self._provider_routing
             max_iterations = _current_max_iterations()
+            _plat = source.platform.value if source.platform else ""
+            _override = os.getenv(f"HERMES_MAX_ITERATIONS_{_plat.upper()}") if _plat else None
+            if _override:
+                try:
+                    max_iterations = int(_override)
+                except ValueError:
+                    pass
             reasoning_config = self._resolve_session_reasoning_config(
                 source=source, model=model
             )
