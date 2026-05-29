@@ -3841,7 +3841,14 @@ def _sync_codex_pool_entries(
 
 
 def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: str = None) -> None:
-    """Save Codex OAuth tokens to Hermes auth store (~/.hermes/auth.json)."""
+    """Save Codex OAuth tokens to Hermes auth store (~/.hermes/auth.json).
+
+    Also mirrors the tokens to 1Password (vault AI-Allowed, items
+    "OpenAI - jeremiahkear@<address>", section "OAuth tokens") so the
+    canonical store and the OpenClaw consumer view stay in sync. The
+    mirror is best-effort: 1P CSW outages do not block the disk write.
+    See workspace/references/codex-oauth-broker-policy-2026-05-29.md.
+    """
     if last_refresh is None:
         last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     with _auth_store_lock():
@@ -3866,6 +3873,52 @@ def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: 
             previous_singleton_tokens=previous_singleton_tokens,
         )
         _save_auth_store(auth_store)
+    _mirror_codex_tokens_to_1p(tokens, last_refresh)
+
+
+def _mirror_codex_tokens_to_1p(tokens: Dict[str, str], last_refresh: str) -> None:
+    """Mirror codex tokens to the canonical 1P-backed store. Best-effort.
+
+    Identifies which account the tokens belong to by decoding the JWT
+    email claim, then writes to the matching 1P item. Never raises:
+    1P CSW outages, CSW unavailability, or import-path issues all log
+    a warning and return. Hermes's on-disk pool remains authoritative
+    for read until the cutover phase (see broker policy doc).
+    """
+    try:
+        import base64 as _b64, json as _json, sys as _sys
+        at = (tokens or {}).get("access_token") or ""
+        if not at or "." not in at:
+            return
+        try:
+            payload = at.split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            email = _json.loads(_b64.urlsafe_b64decode(payload)).get(
+                "https://api.openai.com/profile", {}
+            ).get("email", "")
+        except Exception:
+            return
+        account = (
+            "hotmail" if email == "jeremiahkear@hotmail.com"
+            else "gmail" if email == "jeremiahkear@gmail.com"
+            else None
+        )
+        if account is None:
+            logger.debug("codex 1P mirror: unknown email %r; skipping", email)
+            return
+        lib_path = "/Users/minimiah/.openclaw/workspace/LAWS_GUARDS"
+        if lib_path not in _sys.path:
+            _sys.path.insert(0, lib_path)
+        from lib import codex_tokens as _ct  # type: ignore
+        _ct.write_tokens(
+            account,
+            access_token=at,
+            refresh_token=(tokens or {}).get("refresh_token") or "",
+            last_refresh_at=last_refresh,
+        )
+        logger.debug("codex 1P mirror: wrote tokens for %s", account)
+    except Exception as exc:
+        logger.warning("codex 1P mirror failed (non-fatal): %s", exc)
 
 
 def _recover_codex_tokens_from_cli(reason: str) -> Optional[Dict[str, str]]:
