@@ -39,6 +39,7 @@ from hermes_cli.auth import (
     has_usable_secret,
     is_actual_local_base_url,
     normalize_actual_base_url,
+    _safe_codex_account_alias,
 )
 from hermes_cli.config import (
     get_compatible_custom_providers,
@@ -604,7 +605,7 @@ def _resolve_runtime_from_pool_entry(
     if provider == "lmstudio":
         base_url = auth_mod._normalize_lmstudio_runtime_base_url(base_url)
 
-    return {
+    result = {
         "provider": provider,
         "api_mode": api_mode,
         "base_url": base_url,
@@ -613,6 +614,11 @@ def _resolve_runtime_from_pool_entry(
         "credential_pool": pool,
         "requested_provider": requested_provider,
     }
+    if provider == "openai-codex":
+        account_alias = _safe_codex_account_alias(getattr(entry, "label", ""))
+        if account_alias:
+            result["codex_account_alias"] = account_alias
+    return result
 
 
 def resolve_requested_provider(requested: Optional[str] = None) -> str:
@@ -2089,6 +2095,7 @@ def resolve_runtime_provider(
                 "source": creds.get("source", "hermes-auth-store"),
                 "last_refresh": creds.get("last_refresh"),
                 "requested_provider": requested_provider,
+                "codex_account_alias": _safe_codex_account_alias(creds.get("codex_account_alias")),
             }
         except AuthError:
             if requested_provider != "auto":

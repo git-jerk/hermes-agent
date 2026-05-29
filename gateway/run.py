@@ -2884,6 +2884,7 @@ def _resolve_runtime_agent_kwargs() -> dict:
         "args": list(runtime.get("args") or []),
         "credential_pool": runtime.get("credential_pool"),
         "max_tokens": max_tokens,
+        "codex_account_alias": runtime.get("codex_account_alias"),
     }
 
 
@@ -2896,6 +2897,7 @@ class _GatewayModelContext:
     base_url: str
     context_length: int
     context_source: str
+    codex_account_alias: str = ""
 
 
 def _resolve_gateway_model_context(model: Optional[str] = None) -> _GatewayModelContext:
@@ -2912,6 +2914,7 @@ def _resolve_gateway_model_context(model: Optional[str] = None) -> _GatewayModel
     provider = None
     base_url = None
     api_key = None
+    codex_account_alias = ""
     custom_providers = None
     configured_model = None
     configured_provider = None
@@ -2947,6 +2950,12 @@ def _resolve_gateway_model_context(model: Optional[str] = None) -> _GatewayModel
         provider = runtime.get("provider") or provider
         base_url = runtime.get("base_url") or base_url
         api_key = runtime.get("api_key")
+        try:
+            from hermes_cli.auth import _safe_codex_account_alias
+
+            codex_account_alias = _safe_codex_account_alias(runtime.get("codex_account_alias"))
+        except Exception:
+            codex_account_alias = ""
     except Exception:
         pass
 
@@ -3001,6 +3010,7 @@ def _resolve_gateway_model_context(model: Optional[str] = None) -> _GatewayModel
         base_url=base_url or "",
         context_length=context_length,
         context_source=context_source,
+        codex_account_alias=codex_account_alias,
     )
 
 
@@ -20964,6 +20974,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         provider = resolved.provider
         base_url = resolved.base_url
         context_length = resolved.context_length
+        codex_account_alias = resolved.codex_account_alias
 
         # Format context source hint
         if resolved.context_source == "config":
@@ -20984,8 +20995,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         lines = [
             f"◆ Model: `{model}`",
             f"◆ Provider: {provider or 'openrouter'}",
-            f"◆ Context: {ctx_display} tokens ({ctx_source})",
         ]
+        if (provider or "").strip().lower() == "openai-codex" and codex_account_alias:
+            lines.append(f"◆ Codex account: {codex_account_alias}")
+        lines.append(f"◆ Context: {ctx_display} tokens ({ctx_source})")
 
         # Show endpoint for local/custom setups
         if base_url and base_url_hostname(base_url) in ("localhost", "127.0.0.1", "0.0.0.0"):

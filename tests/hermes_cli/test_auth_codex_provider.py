@@ -66,6 +66,65 @@ def test_resolve_codex_runtime_credentials_missing_access_token(tmp_path, monkey
     assert exc.value.relogin_required is True
 
 
+def test_resolve_codex_runtime_credentials_refreshes_expiring_token(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    expiring_token = _jwt_with_exp(int(time.time()) - 10)
+    _setup_hermes_auth(hermes_home, access_token=expiring_token, refresh_token="refresh-old")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    called = {"count": 0}
+
+    def _fake_refresh(tokens, timeout_seconds):
+        called["count"] += 1
+        return {"access_token": "access-new", "refresh_token": "refresh-new"}
+
+    monkeypatch.setattr("hermes_cli.auth._refresh_codex_auth_tokens", _fake_refresh)
+
+    resolved = resolve_codex_runtime_credentials()
+
+    assert called["count"] == 1
+    assert resolved["api_key"] == "access-new"
+
+
+def test_resolve_codex_runtime_credentials_preserves_safe_account_alias(monkeypatch):
+    from hermes_cli import auth as auth_mod
+
+    monkeypatch.setattr(
+        auth_mod,
+        "_read_codex_tokens",
+        lambda **_kwargs: {
+            "tokens": {"access_token": "access", "refresh_token": "refresh"},
+            "last_refresh": "2026-02-26T00:00:00Z",
+            "codex_account_alias": "hotmail",
+        },
+    )
+    monkeypatch.setattr(auth_mod, "_codex_access_token_is_expiring", lambda *_args, **_kwargs: False)
+
+    resolved = resolve_codex_runtime_credentials(refresh_if_expiring=True)
+
+    assert resolved["api_key"] == "access"
+    assert resolved["codex_account_alias"] == "hotmail"
+
+
+def test_resolve_codex_runtime_credentials_force_refresh(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    _setup_hermes_auth(hermes_home, access_token="access-current", refresh_token="refresh-old")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    called = {"count": 0}
+
+    def _fake_refresh(tokens, timeout_seconds):
+        called["count"] += 1
+        return {"access_token": "access-forced", "refresh_token": "refresh-new"}
+
+    monkeypatch.setattr("hermes_cli.auth._refresh_codex_auth_tokens", _fake_refresh)
+
+    resolved = resolve_codex_runtime_credentials(force_refresh=True, refresh_if_expiring=False)
+
+    assert called["count"] == 1
+    assert resolved["api_key"] == "access-forced"
+
+
 def test_resolve_codex_runtime_credentials_falls_back_to_pool_when_singleton_empty(tmp_path, monkeypatch):
     """Regression for #32992 — chat path returns 401 when singleton is empty but pool has creds.
 

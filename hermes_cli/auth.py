@@ -3690,6 +3690,24 @@ def _print_loopback_ssh_hint(redirect_uri: str, *, docs_url: str | None = None) 
 # where one app's refresh invalidates the other's session.
 # =============================================================================
 
+def _safe_codex_account_alias(label: Any) -> str:
+    """Return a display-safe Codex account alias.
+
+    Raw pool labels and token-derived labels may contain full emails or 1Password
+    item names. Gateway status surfaces should show only coarse aliases that are
+    useful for this install's routing (currently hotmail/gmail), never account
+    identifiers, tokens, or secret-store item titles.
+    """
+    raw = str(label or "").strip().lower()
+    if not raw:
+        return ""
+    if "hotmail" in raw:
+        return "hotmail"
+    if "gmail" in raw:
+        return "gmail"
+    return ""
+
+
 def _read_codex_tokens_from_1p(auth_store: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     """Try to read Codex tokens from the canonical 1P-backed store.
 
@@ -3761,12 +3779,14 @@ def _read_codex_tokens_from_1p(auth_store: Optional[Dict[str, Any]] = None) -> O
             continue
         if not isinstance(refresh_token, str) or not refresh_token.strip():
             continue
+        account_alias = _safe_codex_account_alias(account)
         return {
             "tokens": {
                 "access_token": access_token,
                 "refresh_token": refresh_token,
             },
             "last_refresh": tokens.get("last_refresh_at"),
+            "codex_account_alias": account_alias,
         }
 
     return None
@@ -4382,6 +4402,7 @@ def resolve_codex_runtime_credentials(
         "source": "hermes-auth-store",
         "last_refresh": data.get("last_refresh"),
         "auth_mode": "chatgpt",
+        "codex_account_alias": _safe_codex_account_alias(data.get("codex_account_alias")),
     }
 
 
