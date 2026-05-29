@@ -34,6 +34,18 @@ def cmd_proxy_start(args: Any) -> int:
         _print_aiohttp_missing()
         return 1
 
+    # Per-request + failover/cooldown visibility. Without this the proxy is a
+    # black box (root logger defaults to WARNING) — essential for a cap-aware
+    # routing proxy where you need to see which account served each request.
+    import sys as _sys
+    _plog = logging.getLogger("hermes_cli.proxy")
+    _plog.setLevel(logging.INFO)
+    if not _plog.handlers:
+        _h = logging.StreamHandler(_sys.stderr)
+        _h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        _plog.addHandler(_h)
+    _plog.propagate = False
+
     provider = getattr(args, "provider", None) or "nous"
     try:
         adapter = get_adapter(provider)

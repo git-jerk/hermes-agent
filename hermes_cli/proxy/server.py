@@ -220,6 +220,8 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
                     return session_or_response
                 session = session_or_response
 
+        logger.info("%s /v1%s -> %s", request.method, rel_path, upstream_resp.status)
+
         # Stream response back. Headers first, then chunked body.
         resp = web.StreamResponse(
             status=upstream_resp.status,
