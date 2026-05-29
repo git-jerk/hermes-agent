@@ -14,8 +14,8 @@ The proxy server is otherwise provider-agnostic.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import FrozenSet, Optional
+from dataclasses import dataclass, field
+from typing import Dict, FrozenSet, Optional
 
 
 @dataclass(frozen=True)
@@ -33,6 +33,14 @@ class UpstreamCredential:
 
     expires_at: Optional[str] = None
     """ISO-8601 expiry timestamp for the bearer, when known. Informational."""
+
+    extra_headers: Dict[str, str] = field(default_factory=dict)
+    """Additional request headers the adapter wants injected on the forwarded
+    request, applied AFTER ``Authorization`` so they override any client-supplied
+    values. For providers whose upstream needs more than a bearer swap — e.g.
+    the Codex backend's Cloudflare ``originator``/``User-Agent`` allow-list and
+    the ``ChatGPT-Account-ID`` that must match the attached token's account.
+    Empty for bearer-only providers (nous, xai)."""
 
 
 class UpstreamAdapter(ABC):

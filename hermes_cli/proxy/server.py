@@ -143,6 +143,11 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
 
             fwd_headers = _filter_request_headers(request.headers)
             fwd_headers["Authorization"] = f"{active_cred.token_type} {active_cred.bearer}"
+            # Adapter-supplied headers win over client-supplied ones (e.g. Codex
+            # requires its own originator/User-Agent/ChatGPT-Account-ID that must
+            # match the attached token's account — see UpstreamCredential.extra_headers).
+            for _hk, _hv in (active_cred.extra_headers or {}).items():
+                fwd_headers[_hk] = _hv
 
             logger.debug(
                 "proxy: forwarding %s %s -> %s (body=%d bytes)",
