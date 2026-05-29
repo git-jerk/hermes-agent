@@ -3690,17 +3690,109 @@ def _print_loopback_ssh_hint(redirect_uri: str, *, docs_url: str | None = None) 
 # where one app's refresh invalidates the other's session.
 # =============================================================================
 
+def _read_codex_tokens_from_1p(auth_store: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    """Try to read Codex tokens from the canonical 1P-backed store.
+
+    Returns the same shape as ``_read_codex_tokens`` (dict with ``tokens``
+    and ``last_refresh``) or ``None`` on any failure: 1P CSW down, library
+    import error, both accounts empty, both flagged exhausted in the pool.
+
+    Account selection matches the existing pool selector: lowest priority
+    number wins, skip entries with ``last_status`` of ``exhausted``/``error``
+    or with a non-empty ``last_error_code``. This keeps the per-account
+    rotation behavior identical while changing only the storage backend.
+
+    See workspace/references/codex-oauth-broker-policy-2026-05-29.md for
+    the phased migration plan.
+    """
+    try:
+        import sys as _sys
+        lib_path = "/Users/minimiah/.openclaw/workspace/LAWS_GUARDS"
+        if lib_path not in _sys.path:
+            _sys.path.insert(0, lib_path)
+        from lib import codex_tokens as _ct  # type: ignore
+    except Exception as exc:
+        logger.warning("codex 1P read: library import failed (%s); falling back to disk", exc)
+        return None
+
+    try:
+        if auth_store is None:
+            auth_store = _load_auth_store()
+    except Exception:
+        auth_store = {}
+    pool = (auth_store.get("credential_pool", {}) or {}).get("openai-codex", []) or []
+    healthy_accounts: list[str] = []
+    if pool:
+        # Honor pool flags: skip accounts marked exhausted/errored, preserve
+        # the priority order. This preserves existing rotation behavior
+        # during the dual-write window before the disk pool is emptied.
+        for entry in sorted(pool, key=lambda c: c.get("priority", 999)):
+            if entry.get("last_status") in ("exhausted", "error"):
+                continue
+            if entry.get("last_error_code"):
+                continue
+            label = (entry.get("label") or "").lower()
+            if "hotmail" in label and "hotmail" not in healthy_accounts:
+                healthy_accounts.append("hotmail")
+            elif "gmail" in label and "gmail" not in healthy_accounts:
+                healthy_accounts.append("gmail")
+    else:
+        # Empty/missing pool (post-cutover state, intentional). Default to
+        # hotmail-first-then-gmail to match the historical priority order.
+        # Pool flag handling is no longer applicable because the pool no
+        # longer exists.
+        healthy_accounts = ["hotmail", "gmail"]
+    if not healthy_accounts:
+        return None
+
+    logger.info("codex 1P read: trying accounts %s", healthy_accounts)
+    for account in healthy_accounts:
+        try:
+            tokens = _ct.read_tokens(account)
+        except Exception as exc:
+            logger.warning("codex 1P read: account %s read failed (%s)", account, exc)
+            tokens = None
+        if not tokens:
+            logger.warning("codex 1P read: account %s returned no tokens", account)
+            continue
+        access_token = tokens.get("access_token")
+        refresh_token = tokens.get("refresh_token")
+        if not isinstance(access_token, str) or not access_token.strip():
+            continue
+        if not isinstance(refresh_token, str) or not refresh_token.strip():
+            continue
+        return {
+            "tokens": {
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+            },
+            "last_refresh": tokens.get("last_refresh_at"),
+        }
+
+    return None
+
+
 def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
-    """Read Codex OAuth tokens from Hermes auth store (~/.hermes/auth.json).
-    
+    """Read Codex OAuth tokens.
+
+    Prefers the canonical 1P-backed store (vault AI-Allowed, items
+    "OpenAI - jeremiahkear@<address>", section "OAuth tokens") and falls
+    back to the on-disk store at ~/.hermes/auth.json (singleton
+    ``providers.openai-codex.tokens``) when 1P is unreachable or empty.
+
     Returns dict with 'tokens' (access_token, refresh_token) and 'last_refresh'.
-    Raises AuthError if no Codex tokens are stored.
+    Raises AuthError if no Codex tokens are stored in either source.
     """
     if _lock:
         with _auth_store_lock():
             auth_store = _load_auth_store()
     else:
         auth_store = _load_auth_store()
+
+    onep = _read_codex_tokens_from_1p(auth_store)
+    if onep is not None:
+        return onep
+
     state = _load_provider_state(auth_store, "openai-codex")
     if not state:
         raise AuthError(
