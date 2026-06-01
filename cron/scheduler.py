@@ -7128,8 +7128,9 @@ def tick(
             logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
 
         # Advance next_run_at for all recurring jobs FIRST, under the file lock,
-        # before any execution begins.  This preserves at-most-once semantics.
-        # For parallel jobs that are already running, the advance keeps
+        # before any execution begins. This preserves at-most-once semantics for
+        # recurring jobs even after the lock is released before job execution.
+        # For parallel jobs that are already running, advance_next_runs keeps
         # bumping next_run_at forward so the grace window never expires.
         # mark_job_run() overwrites next_run_at on completion.
         # Batched: one load + one save for the whole due set, not one per job.
@@ -7138,6 +7139,30 @@ def tick(
         # re-anchor from their own "now" at claim time (harmless for
         # at-most-once — mark_job_run re-anchors at completion regardless).
         advance_next_runs([job["id"] for job in due_jobs])
+
+        # One-shot jobs intentionally keep the lock through execution so they
+        # cannot double-fire while ``last_run_at`` is still unset. Recurring jobs
+        # have already been advanced, so release the global tick lock before
+        # running long jobs; otherwise one slow LLM cron run starves every other
+        # gateway tick until it returns.
+        hold_lock_during_execution = any(
+            isinstance(job.get("schedule"), dict)
+            and job["schedule"].get("kind") == "once"
+            for job in due_jobs
+        )
+        if not hold_lock_during_execution:
+            if fcntl:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                except (OSError, IOError):
+                    pass
+            elif msvcrt:
+                try:
+                    msvcrt.locking(lock_fd.fileno(), msvcrt.LK_UNLCK, 1)
+                except (OSError, IOError):
+                    pass
+            lock_fd.close()
+            lock_fd = None
 
         # Resolve max parallel workers: env var > config.yaml > unbounded.
         # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.
@@ -7397,17 +7422,18 @@ def tick(
 
         return sum(_results)
     finally:
-        if fcntl:
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            except (OSError, IOError):
-                pass
-        elif msvcrt:
-            try:
-                msvcrt.locking(lock_fd.fileno(), msvcrt.LK_UNLCK, 1)
-            except (OSError, IOError):
-                pass
-        lock_fd.close()
+        if lock_fd is not None:
+            if fcntl:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                except (OSError, IOError):
+                    pass
+            elif msvcrt:
+                try:
+                    msvcrt.locking(lock_fd.fileno(), msvcrt.LK_UNLCK, 1)
+                except (OSError, IOError):
+                    pass
+            lock_fd.close()
 
 
 if __name__ == "__main__":

@@ -1919,6 +1919,7 @@ class TestParallelTick:
         ]
 
         with patch("cron.scheduler.get_due_jobs", return_value=jobs), \
+             patch("cron.scheduler.advance_next_runs"), \
              patch("cron.scheduler.claim_job_for_fire", return_value=True), \
              patch("cron.scheduler.run_job", side_effect=mock_run_job), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
@@ -1932,6 +1933,72 @@ class TestParallelTick:
         end_s1 = [t for action, jid, t in call_times if action == "end" and jid == "s1"][0]
         start_s2 = [t for action, jid, t in call_times if action == "start" and jid == "s2"][0]
         assert start_s2 >= end_s1, "Jobs ran concurrently despite max_parallel=1"
+
+    def test_tick_releases_file_lock_before_long_job_execution(self, tmp_path):
+        """A long cron job must not hold the global tick lock while executing.
+
+        The lock only needs to cover due-job discovery and ``next_run_at``
+        advancement. Holding it through ``run_job`` lets one slow LLM cron run
+        starve every other gateway tick.
+        """
+        import threading
+
+        fcntl_mod = pytest.importorskip("fcntl")
+
+        lock_dir = tmp_path / "cron-lock-release"
+        lock_dir.mkdir()
+        lock_file = lock_dir / ".tick.lock"
+        job_started = threading.Event()
+        release_job = threading.Event()
+        tick_result = {}
+
+        def mock_run_job(job, *, defer_agent_teardown=None, **_kw):
+            job_started.set()
+            assert release_job.wait(timeout=5), "test did not release mock cron job"
+            return (True, "output", "response", None)
+
+        def run_tick():
+            from cron.scheduler import tick
+            tick_result["value"] = tick(verbose=False)
+
+        jobs = [
+            {
+                "id": "slow-job",
+                "name": "slow",
+                "deliver": "local",
+                "schedule": {"kind": "interval", "minutes": 5},
+            }
+        ]
+
+        with patch("cron.scheduler._get_lock_paths", return_value=(lock_dir, lock_file)), \
+             patch("cron.scheduler.get_due_jobs", return_value=jobs), \
+             patch("cron.scheduler.advance_next_runs"), \
+             patch("cron.scheduler.claim_job_for_fire", return_value=True), \
+             patch("cron.scheduler.run_job", side_effect=mock_run_job), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result", return_value=None), \
+             patch("cron.scheduler.mark_job_run"):
+            thread = threading.Thread(target=run_tick)
+            thread.start()
+            assert job_started.wait(timeout=5), "tick did not start mock cron job"
+
+            probe_fd = open(lock_file, "w", encoding="utf-8")
+            acquired = False
+            try:
+                try:
+                    fcntl_mod.flock(probe_fd, fcntl_mod.LOCK_EX | fcntl_mod.LOCK_NB)
+                    acquired = True
+                except OSError:
+                    acquired = False
+                assert acquired, "tick lock was still held after due jobs were advanced"
+            finally:
+                if acquired:
+                    fcntl_mod.flock(probe_fd, fcntl_mod.LOCK_UN)
+                probe_fd.close()
+                release_job.set()
+                thread.join(timeout=5)
+
+        assert tick_result["value"] == 1
 
 
 class TestDeliverResultTimeoutCancelsFuture:
