@@ -146,6 +146,12 @@ also lazy-installable at runtime via `tools/lazy_deps.py` — those
 delegate the actual install to first use of the backend (see
 `tools/lazy_deps.py:LAZY_DEPS`).
 
+> ⛔ **Banned origin — never install or enable** (CORE_DIRECTIVE supply-chain
+> rule): `py-extra.wecom` (Tencent), `py-extra.dingtalk` (Alibaba),
+> `py-extra.feishu` (ByteDance). Upstream ships these adversarial-origin platform
+> adapters; they are tracked here only to record the risk surface and are **not
+> installed or enabled** in this deployment.
+
 | Probe | Composition | Status | Update method | Declared in |
 |---|---|---|---|---|
 | `py-extra.anthropic` | pyproject: `anthropic==0.86.0`; lazy: `anthropic==0.87.0` | 🔒 | frozen | `pyproject.toml` + `tools/lazy_deps.py` |

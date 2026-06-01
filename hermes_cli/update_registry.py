@@ -432,18 +432,35 @@ def _register_builtin_probes() -> None:
         "youtube",
         "web",
     }
+    # Adversarial-origin platform extras: upstream ships these, but the
+    # CORE_DIRECTIVE supply-chain rule hard-blocks China/Russia/etc. software.
+    # Tracked ONLY to record the upstream risk surface; flagged updateable=False
+    # so the inventory never presents them as installable. NOT installed/enabled
+    # in this deployment.
+    _BANNED_ORIGIN_EXTRAS = {
+        "wecom": "Tencent",
+        "dingtalk": "Alibaba",
+        "feishu": "ByteDance/Lark",
+    }
     for extra, specs, desc in _EXTRAS:
+        banned = _BANNED_ORIGIN_EXTRAS.get(extra)
+        description = f"{desc} — pip extras `[{extra}]`: {specs}"
+        if banned:
+            description = (
+                f"⛔ BANNED ORIGIN ({banned}, China) — DO NOT INSTALL/ENABLE "
+                f"per CORE_DIRECTIVE supply-chain rule. {description}"
+            )
         register_probe(UpdateProbe(
             name=f"py-extra.{extra}",
             category="python-extras",
-            description=f"{desc} — pip extras `[{extra}]`: {specs}",
+            description=description,
             declared_in=(
                 "pyproject.toml + tools/lazy_deps.py"
                 if extra in _LAZY_BACKED_EXTRAS
                 else "pyproject.toml"
             ),
             current_version=None,  # extra is a group, not a single version
-            updateable=True,
+            updateable=not banned,  # banned-origin extras must never be installed
             update_method="frozen",
             refresh_command=(
                 "python3 -c \"import tomllib, sys; "
@@ -453,6 +470,10 @@ def _register_builtin_probes() -> None:
                 f"echo '  curl -s https://pypi.org/pypi/<pkg>/json | python3 -c \"import json,sys; print(json.load(sys.stdin)[chr(34)+\"info\"+chr(34)])\"'"
             ),
             notes=(
+                f"⛔ ADVERSARIAL ORIGIN ({banned}, China) — never install or "
+                "enable; banned by the CORE_DIRECTIVE supply-chain rule. Tracked "
+                "only to record the upstream risk surface."
+                if banned else
                 "mistral extra REMOVED 2026-05-12 (PyPI quarantine); see "
                 "pyproject.toml comment for restoration checklist. Each "
                 "pinned package in the extra follows the same no-ranges policy."

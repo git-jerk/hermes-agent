@@ -390,6 +390,18 @@ class TestBuiltinProbes:
             assert probe is not None
             assert probe.declared_in == "pyproject.toml + tools/lazy_deps.py"
 
+    def test_banned_origin_extras_are_flagged(self):
+        """Adversarial-origin platform extras (Tencent/Alibaba/ByteDance) must be
+        flagged updateable=False with a BANNED ORIGIN marker so the inventory
+        enforces the CORE_DIRECTIVE supply-chain rule instead of listing them as
+        ordinary installable extras."""
+        for extra in ("wecom", "dingtalk", "feishu"):
+            probe = get_probe(f"py-extra.{extra}")
+            assert probe is not None, f"{extra} probe missing"
+            assert probe.updateable is False, f"{extra} must be updateable=False"
+            assert "BANNED ORIGIN" in probe.description, f"{extra} desc must flag origin"
+            assert "ADVERSARIAL ORIGIN" in probe.notes, f"{extra} notes must flag origin"
+
     def test_refresh_commands_avoid_mutating_source_tree_for_checks(self):
         """Registry refresh snippets are meant as check probes. They must
         not rewrite tracked files in-place just to answer whether an
