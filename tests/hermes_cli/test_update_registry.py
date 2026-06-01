@@ -318,8 +318,11 @@ class TestBuiltinProbes:
         )
         assert match, "Couldn't find [project.dependencies] block"
         deps_block = match.group(1)
-        # Count exact-pinned entries (`"pkg==..."`), one per line.
-        pinned = re.findall(r'^\s*"[A-Za-z][A-Za-z0-9_.\-\[\]]*==', deps_block, re.MULTILINE)
+        # Count exact-pinned entries (`"pkg==..."`), one per line. The
+        # char class includes `,` so multi-extra pins like
+        # `psycopg[binary,pool]==` are counted — the comma previously
+        # broke the match and silently undercounted such deps.
+        pinned = re.findall(r'^\s*"[A-Za-z][A-Za-z0-9_.,\-\[\]]*==', deps_block, re.MULTILINE)
         probe_count = len(list_probes(category="python-core-deps"))
         assert probe_count == len(pinned), (
             f"python-core-deps probe count ({probe_count}) does not "

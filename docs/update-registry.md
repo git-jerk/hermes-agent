@@ -99,7 +99,7 @@ the `mistralai 2.4.6` worm on PyPI. Every direct dep is pinned to
 | Probe | Current | Status | Update method | Declared in |
 |---|---|---|---|---|
 | `py.openai` | 2.24.0 | 🔒 | frozen | `pyproject.toml` |
-| `py.python-dotenv` | 1.2.1 | 🔒 | frozen | `pyproject.toml` |
+| `py.python-dotenv` | 1.2.2 | 🔒 | frozen | `pyproject.toml` |
 | `py.fire` | 0.7.1 | 🔒 | frozen | `pyproject.toml` |
 | `py.httpx` | 0.28.1 | 🔒 | frozen | `pyproject.toml` |
 | `py.rich` | 14.3.3 | 🔒 | frozen | `pyproject.toml` |
@@ -108,9 +108,10 @@ the `mistralai 2.4.6` worm on PyPI. Every direct dep is pinned to
 | `py.ruamel.yaml` | 0.18.17 | 🔒 | frozen | `pyproject.toml` |
 | `py.requests` | 2.33.0 | 🔒 | frozen | `pyproject.toml` |
 | `py.jinja2` | 3.1.6 | 🔒 | frozen | `pyproject.toml` |
-| `py.pydantic` | 2.12.5 | 🔒 | frozen | `pyproject.toml` |
+| `py.pydantic` | 2.13.4 | 🔒 | frozen | `pyproject.toml` |
 | `py.prompt_toolkit` | 3.0.52 | 🔒 | frozen | `pyproject.toml` |
 | `py.croniter` | 6.0.0 | 🔒 | frozen | `pyproject.toml` |
+| `py.psycopg` | 3.2.10 | 🔒 | frozen | `pyproject.toml` |
 | `py.PyJWT` | 2.12.1 | 🔒 | frozen | `pyproject.toml` |
 | `py.tzdata` | 2025.3 | 🔒 | frozen | `pyproject.toml` |
 | `py.psutil` | 7.2.2 | 🔒 | frozen | `pyproject.toml` |
@@ -123,7 +124,7 @@ python3 -c "import tomllib; d=tomllib.load(open('pyproject.toml','rb')); [print(
 
 # Compare each pin to PyPI latest. Loop variant for paste-in:
 for pkg in openai python-dotenv fire httpx rich tenacity pyyaml ruamel.yaml \
-           requests jinja2 pydantic prompt_toolkit croniter PyJWT tzdata psutil; do
+           requests jinja2 pydantic prompt_toolkit croniter psycopg PyJWT tzdata psutil; do
     latest=$(curl -s "https://pypi.org/pypi/${pkg}/json" \
         | python3 -c 'import json,sys; print(json.load(sys.stdin)["info"]["version"])' 2>/dev/null)
     pinned=$(grep -oE "^\s*\"${pkg}==[^\"]+\"" pyproject.toml | head -1)

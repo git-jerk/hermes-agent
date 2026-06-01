@@ -322,7 +322,7 @@ def _register_builtin_probes() -> None:
     # core dep requires editing pyproject.toml + regenerating uv.lock.
     _CORE_DEPS = [
         ("openai", "2.24.0", "OpenAI SDK (provider= openai, openrouter, custom aggregators)"),
-        ("python-dotenv", "1.2.1", ".env file loader"),
+        ("python-dotenv", "1.2.2", ".env file loader"),
         ("fire", "0.7.1", "Google Fire — CLI argument parser"),
         ("httpx", "0.28.1", "HTTP client (with SOCKS extras)"),
         ("rich", "14.3.3", "Terminal formatting"),
@@ -331,9 +331,10 @@ def _register_builtin_probes() -> None:
         ("ruamel.yaml", "0.18.17", "Round-trip YAML editor"),
         ("requests", "2.33.0", "HTTP client (CVE-2026-25645 fix)"),
         ("jinja2", "3.1.6", "Template engine"),
-        ("pydantic", "2.12.5", "Data validation"),
+        ("pydantic", "2.13.4", "Data validation"),
         ("prompt_toolkit", "3.0.52", "Interactive CLI input (used directly by cli.py)"),
         ("croniter", "6.0.0", "Cron expression parser (built-in scheduler)"),
+        ("psycopg", "3.2.10", "PostgreSQL driver (binary+pool extras; Kanban Postgres backend)"),
         ("PyJWT", "2.12.1", "JWT signing (Skills Hub GitHub App; CVE-2026-32597 fix)"),
         ("tzdata", "2025.3", "Windows IANA timezone data (Windows-only conditional)"),
         ("psutil", "7.2.2", "Cross-platform process management"),
