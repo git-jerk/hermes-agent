@@ -246,7 +246,7 @@ REQUIRED_PROBES = {
     "nix.npm-lockfile-fix",
     # docker-base
     "docker.uv-source",
-    "docker.gosu-source",
+    "docker.node-source",
     "docker.debian",
     # system-binaries
     "apt.runtime-toolchain",
@@ -380,7 +380,7 @@ class TestBuiltinProbes:
     def test_lazy_backed_extras_show_lazy_deps_declaration(self):
         lazy_backed = {
             "anthropic", "exa", "firecrawl", "parallel-web", "fal",
-            "edge-tts", "modal", "daytona", "vercel", "hindsight",
+            "edge-tts", "modal", "daytona", "wecom", "hindsight",
             "messaging", "slack", "matrix", "tts-premium", "voice",
             "honcho", "acp", "bedrock", "azure-identity", "dingtalk",
             "feishu", "google", "youtube", "web",

@@ -374,7 +374,7 @@ def _register_builtin_probes() -> None:
         ("edge-tts", "edge-tts==7.2.7", "Edge TTS backend"),
         ("modal", "modal==1.3.4", "Modal terminal sandbox"),
         ("daytona", "daytona==0.155.0", "Daytona terminal sandbox"),
-        ("vercel", "vercel==0.5.7", "Vercel terminal sandbox"),
+        ("wecom", "defusedxml==0.7.1", "WeCom (Enterprise WeChat) callback-mode adapter"),
         ("hindsight", "hindsight-client==0.6.1", "Hindsight memory backend"),
         ("dev", "debugpy==1.8.20, pytest==9.0.2, pytest-asyncio==1.3.0, pytest-xdist==3.8.0, pytest-split==0.11.0, mcp==1.26.0, ty==0.0.21, ruff==0.15.10", "Dev/test toolchain"),
         ("messaging", "pyproject: python-telegram-bot[webhooks]==22.6, discord.py[voice]==2.7.1, aiohttp==3.13.3, brotlicffi==1.2.0.1, slack-bolt==1.27.0, slack-sdk==3.40.1, qrcode==7.4.2; lazy platforms: telegram python-telegram-bot[webhooks]==22.6; discord discord.py[voice]==2.7.1 + brotlicffi==1.2.0.1; slack slack-bolt==1.27.0 + slack-sdk==3.40.1 + aiohttp==3.13.4", "Messaging adapters (composite)"),
@@ -415,7 +415,7 @@ def _register_builtin_probes() -> None:
         "edge-tts",
         "modal",
         "daytona",
-        "vercel",
+        "wecom",
         "hindsight",
         "messaging",
         "slack",
@@ -565,18 +565,22 @@ def _register_builtin_probes() -> None:
         ),
     ))
     register_probe(UpdateProbe(
-        name="docker.gosu-source",
+        name="docker.node-source",
         category="docker-base",
-        description="tianon/gosu multi-stage source image (privilege drop helper)",
+        description="node:22-bookworm-slim multi-stage source image (node/npm/corepack)",
         declared_in="Dockerfile",
-        current_version="1.19-trixie",
+        current_version="22-bookworm-slim",
         updateable=True,
         update_method="manual",
         refresh_command=_DOCKER_PROBE_TEMPLATE.format(
-            image="tianon/gosu:1.19-trixie",
-            image_match="tianon/gosu",
+            image="node:22-bookworm-slim",
+            image_match="node:",
         ),
-        notes="Pinned by digest. Used by docker/entrypoint.sh for UID/GID remap.",
+        notes=(
+            "Pinned by digest. node/npm/corepack are COPYed from this stage "
+            "into the debian:13.4 runtime (see the Dockerfile node_source "
+            "stage). Bump strategy: pick a newer node LTS tag + refresh digest."
+        ),
     ))
     register_probe(UpdateProbe(
         name="docker.debian",

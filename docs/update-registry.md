@@ -156,7 +156,7 @@ delegate the actual install to first use of the backend (see
 | `py-extra.edge-tts` | `edge-tts==7.2.7` | 🔒 | frozen | `pyproject.toml` + `tools/lazy_deps.py` |
 | `py-extra.modal` | `modal==1.3.4` | 🔒 | frozen | `pyproject.toml` + `tools/lazy_deps.py` |
 | `py-extra.daytona` | `daytona==0.155.0` | 🔒 | frozen | `pyproject.toml` + `tools/lazy_deps.py` |
-| `py-extra.vercel` | `vercel==0.5.7` | 🔒 | frozen | `pyproject.toml` + `tools/lazy_deps.py` |
+| `py-extra.wecom` | `defusedxml==0.7.1` | 🔒 | frozen | `pyproject.toml` + `tools/lazy_deps.py` |
 | `py-extra.hindsight` | `hindsight-client==0.6.1` | 🔒 | frozen | `pyproject.toml` + `tools/lazy_deps.py` |
 | `py-extra.dev` | `debugpy==1.8.20`, `pytest==9.0.2`, `pytest-asyncio==1.3.0`, `pytest-xdist==3.8.0`, `pytest-split==0.11.0`, `mcp==1.26.0`, `ty==0.0.21`, `ruff==0.15.10` | 🔒 | frozen | `pyproject.toml` |
 | `py-extra.messaging` | pyproject platform bundle plus lazy pins; lazy Slack currently uses `aiohttp==3.13.4` | 🔒 | frozen | `pyproject.toml` + `tools/lazy_deps.py` |
@@ -309,7 +309,7 @@ digest, and rebuilding.
 | Probe | Pinned tag | Status | Update method | Declared in |
 |---|---|---|---|---|
 | `docker.uv-source` | `0.11.6-python3.13-trixie` | ? | manual | `Dockerfile` |
-| `docker.gosu-source` | `1.19-trixie` | ? | manual | `Dockerfile` |
+| `docker.node-source` | `22-bookworm-slim` | ? | manual | `Dockerfile` |
 | `docker.debian` | `13.4` | ? | manual | `Dockerfile` |
 
 **Refresh command:**
@@ -320,8 +320,8 @@ grep -E '^FROM ' Dockerfile
 
 # Compare each pinned tag to the registry digest it currently resolves to. uv:
 docker pull ghcr.io/astral-sh/uv:0.11.6-python3.13-trixie 2>&1 | tail -3
-# gosu:
-docker pull tianon/gosu:1.19-trixie 2>&1 | tail -3
+# node:
+docker pull node:22-bookworm-slim 2>&1 | tail -3
 # debian:
 docker pull debian:13.4 2>&1 | tail -3
 
@@ -331,7 +331,7 @@ docker manifest inspect ghcr.io/astral-sh/uv:0.11.6-python3.13-trixie | python3 
 
 **Notes:**
 
-- `uv-source` and `gosu-source` are multi-stage `FROM ... AS` source
+- `uv-source` and `node-source` are multi-stage `FROM ... AS` source
   images — they don't ship to runtime, just supply binaries via
   `COPY --from=` to the runtime layer.
 - `debian:13.4` is tag-pinned (not digest-pinned). Bumping picks up
