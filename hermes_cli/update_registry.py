@@ -334,7 +334,7 @@ def _register_builtin_probes() -> None:
         ("pydantic", "2.13.4", "Data validation"),
         ("prompt_toolkit", "3.0.52", "Interactive CLI input (used directly by cli.py)"),
         ("croniter", "6.0.0", "Cron expression parser (built-in scheduler)"),
-        ("psycopg", "3.2.10", "PostgreSQL driver (binary+pool extras; Kanban Postgres backend)"),
+        ("psycopg", "3.3.4", "PostgreSQL driver (binary+pool extras; Kanban Postgres backend)"),
         ("PyJWT", "2.12.1", "JWT signing (Skills Hub GitHub App; CVE-2026-32597 fix)"),
         ("tzdata", "2025.3", "Windows IANA timezone data (Windows-only conditional)"),
         ("psutil", "7.2.2", "Cross-platform process management"),

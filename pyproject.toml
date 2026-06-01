@@ -86,7 +86,12 @@ dependencies = [
   # PG is the durability fix for the WAL/shm sidecar corruption that hit
   # trading-lab / research / qraav in May 2026 — see
   # docs/kanban-storage-postgres-migration.md.
-  "psycopg[binary,pool]==3.2.10",
+  # Bumped 3.2.10 -> 3.3.4: core 3.3 line + psycopg_pool 3.3 pool-reliability
+  # fixes (respect connection() timeout when a check fails, exponential backoff
+  # instead of busy-looping on liveness checks, empty-query check instead of
+  # SELECT 1) — directly relevant to the kanban_storage PoolTimeout / pool-slot
+  # hardening carried in the local-ahead commits.
+  "psycopg[binary,pool]==3.3.4",
   # Skills Hub (GitHub App JWT auth — optional, only needed for bot identity)
   "PyJWT[crypto]==2.13.0",  # PYSEC-2026-175/177/178/179
   # urllib3 2.7.0 fixes GHSA-mf9v-mfxr-j63j (decompression-bomb bypass)

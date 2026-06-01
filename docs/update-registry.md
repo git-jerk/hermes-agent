@@ -111,7 +111,7 @@ the `mistralai 2.4.6` worm on PyPI. Every direct dep is pinned to
 | `py.pydantic` | 2.13.4 | 🔒 | frozen | `pyproject.toml` |
 | `py.prompt_toolkit` | 3.0.52 | 🔒 | frozen | `pyproject.toml` |
 | `py.croniter` | 6.0.0 | 🔒 | frozen | `pyproject.toml` |
-| `py.psycopg` | 3.2.10 | 🔒 | frozen | `pyproject.toml` |
+| `py.psycopg` | 3.3.4 | 🔒 | frozen | `pyproject.toml` |
 | `py.PyJWT` | 2.12.1 | 🔒 | frozen | `pyproject.toml` |
 | `py.tzdata` | 2025.3 | 🔒 | frozen | `pyproject.toml` |
 | `py.psutil` | 7.2.2 | 🔒 | frozen | `pyproject.toml` |
