@@ -56,6 +56,7 @@ from __future__ import annotations
 import logging
 import threading
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -257,6 +258,38 @@ def _reset_for_tests() -> None:
         _probes.clear()
 
 
+def _norm_pkg(name: str) -> str:
+    """Normalize a distribution name for matching (PEP 503-ish)."""
+    return name.strip().lower().replace("_", "-").replace(".", "-")
+
+
+def _load_pyproject_core_pins() -> Dict[str, str]:
+    """Read exact ``==`` pins from pyproject.toml ``[project.dependencies]``.
+
+    Returns ``{normalized_name: version}``. Best-effort: returns ``{}`` when
+    pyproject.toml can't be found or parsed (e.g. the module is installed as a
+    wheel without the source tree), so callers fall back to the static snapshot
+    in ``_CORE_DEPS``. Keeps the python-core inventory from drifting off the
+    declared pins while staying import-safe everywhere.
+    """
+    import tomllib  # stdlib (py>=3.11); local import keeps the module top stdlib-only
+
+    pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    try:
+        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+    pins: Dict[str, str] = {}
+    for spec in data.get("project", {}).get("dependencies", []):
+        base = str(spec).split(";", 1)[0].strip()  # drop env markers
+        if "==" not in base:
+            continue
+        name, _, version = base.partition("==")
+        name = name.split("[", 1)[0]               # drop [extras]
+        pins[_norm_pkg(name)] = version.strip()
+    return pins
+
+
 # ---------------------------------------------------------------------------
 # Built-in probes
 # ---------------------------------------------------------------------------
@@ -320,6 +353,9 @@ def _register_builtin_probes() -> None:
     # Each entry is exact-pinned per the supply-chain policy added
     # 2026-05-12 in response to the mistralai 2.4.6 worm. Updating a
     # core dep requires editing pyproject.toml + regenerating uv.lock.
+    # current_version is read LIVE from pyproject.toml at import (see
+    # _load_pyproject_core_pins); the literals below are curated
+    # name/description plus a fallback version for non-source installs.
     _CORE_DEPS = [
         ("openai", "2.24.0", "OpenAI SDK (provider= openai, openrouter, custom aggregators)"),
         ("python-dotenv", "1.2.2", ".env file loader"),
@@ -339,7 +375,11 @@ def _register_builtin_probes() -> None:
         ("tzdata", "2025.3", "Windows IANA timezone data (Windows-only conditional)"),
         ("psutil", "7.2.2", "Cross-platform process management"),
     ]
-    for pkg, ver, desc in _CORE_DEPS:
+    _live_pins = _load_pyproject_core_pins()
+    for pkg, snapshot_ver, desc in _CORE_DEPS:
+        # Live-read the declared pin; fall back to the snapshot literal when
+        # the source tree isn't present so the module stays import-safe.
+        ver = _live_pins.get(_norm_pkg(pkg), snapshot_ver)
         register_probe(UpdateProbe(
             name=f"py.{pkg}",
             category="python-core-deps",

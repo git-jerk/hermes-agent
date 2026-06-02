@@ -331,6 +331,29 @@ class TestBuiltinProbes:
             "match."
         )
 
+    def test_python_core_versions_are_read_live_from_pyproject(self):
+        """current_version for python-core probes must equal the live
+        pyproject.toml pin (read at import), so the inventory cannot drift
+        from the declared pins the way the old static snapshot did."""
+        import tomllib
+        data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        pins = {}
+        for spec in data["project"]["dependencies"]:
+            base = str(spec).split(";", 1)[0].strip()
+            if "==" not in base:
+                continue
+            name, _, version = base.partition("==")
+            key = name.split("[", 1)[0].strip().lower().replace("_", "-").replace(".", "-")
+            pins[key] = version.strip()
+        for probe in list_probes(category="python-core-deps"):
+            pkg = probe.name[len("py."):]
+            key = pkg.lower().replace("_", "-").replace(".", "-")
+            assert key in pins, f"{probe.name} not in pyproject pins"
+            assert probe.current_version == pins[key], (
+                f"{probe.name}: probe={probe.current_version!r} "
+                f"pyproject={pins[key]!r} — live-read drift"
+            )
+
     def test_docker_base_probes_match_dockerfile_from_lines(self):
         """Every FROM <image> line in the Dockerfile should map to one
         docker-base probe. New base images without a probe surface here."""
