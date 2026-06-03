@@ -719,6 +719,28 @@ class TestMatrixMarkdownToHtml:
         assert "<th>Item</th>" in result
         assert "<td>Apples</td>" in result
 
+    def test_compact_header_followed_by_bullets_renders_as_list(self):
+        """Matrix should get real list HTML even when the agent omits a blank line."""
+        result = self.adapter._markdown_to_html("Header:\n- One\n- Two")
+        assert "Header:" in result
+        assert "<ul>" in result
+        assert result.count("<li>") == 2
+        assert "- One" not in result
+
+    def test_unicode_bullets_render_as_list(self):
+        """Common Unicode bullet output should not render as same-alignment text."""
+        result = self.adapter._markdown_to_html("Header:\n• One\n• Two")
+        assert "<ul>" in result
+        assert "<li>One</li>" in result
+        assert "<li>Two</li>" in result
+        assert "• One" not in result
+
+    def test_list_normalization_ignores_fenced_code(self):
+        result = self.adapter._markdown_to_html("```\nHeader:\n• literal\n- literal\n```")
+        assert "<pre><code>" in result
+        assert "• literal" in result
+        assert "- literal" in result
+        assert "<ul>" not in result
 
 # ---------------------------------------------------------------------------
 # Helper: display name extraction

@@ -5001,6 +5001,47 @@ class MatrixAdapter(BasePlatformAdapter):
         parts = mxc_url[6:]  # strip mxc://
         return f"{self._homeserver}/_matrix/client/v1/media/download/{parts}"
 
+    @staticmethod
+    def _normalize_markdown_lists_for_matrix(text: str) -> str:
+        """Normalize common agent bullet output so Matrix renders real lists.
+
+        Python-Markdown intentionally requires a blank line before a list that
+        follows paragraph text. Agent replies often use compact prose like
+        ``Header:\n- item`` or Unicode bullets like ``• item``. Matrix then gets
+        literal bullet lines instead of ``<ul>/<li>``, so the header and bullets
+        render at the same left edge. Normalize those compact bullets before the
+        Markdown pass while leaving fenced code blocks untouched.
+        """
+        if not text:
+            return text
+
+        list_marker_re = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
+        unicode_bullet_re = re.compile(r"^(\s*)[\u2022\u2023\u2043]\s+")
+        normalized_lines: list[str] = []
+        in_fence = False
+
+        def _is_list_line(line: str) -> bool:
+            return bool(list_marker_re.match(line))
+
+        for raw_line in text.split("\n"):
+            stripped = raw_line.lstrip()
+            if stripped.startswith("```") or stripped.startswith("~~~"):
+                in_fence = not in_fence
+                normalized_lines.append(raw_line)
+                continue
+
+            line = raw_line
+            if not in_fence:
+                line = unicode_bullet_re.sub(r"\1- ", line)
+                if _is_list_line(line):
+                    previous = normalized_lines[-1] if normalized_lines else ""
+                    if previous.strip() and not _is_list_line(previous):
+                        normalized_lines.append("")
+
+            normalized_lines.append(line)
+
+        return "\n".join(normalized_lines)
+
     def _markdown_to_html(self, text: str) -> str:
         """Convert Markdown to Matrix-compatible HTML (org.matrix.custom.html).
 
@@ -5011,6 +5052,7 @@ class MatrixAdapter(BasePlatformAdapter):
         Matrix HTML spec allows.
         """
         text = _pre_sanitize_matrix_markdown(text)
+        text = self._normalize_markdown_lists_for_matrix(text)
         try:
             import markdown as _md
 
