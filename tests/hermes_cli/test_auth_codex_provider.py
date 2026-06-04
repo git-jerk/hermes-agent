@@ -528,6 +528,7 @@ def test_resolve_returns_hermes_auth_store_source(tmp_path, monkeypatch):
     hermes_home = tmp_path / "hermes"
     _setup_hermes_auth(hermes_home)
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("HERMES_CODEX_BASE_URL", raising=False)
 
     creds = resolve_codex_runtime_credentials()
     assert creds["source"] == "hermes-auth-store"
