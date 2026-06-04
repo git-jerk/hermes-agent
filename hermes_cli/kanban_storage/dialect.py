@@ -43,8 +43,9 @@ INSERT…RETURNING
 ----------------
 
 SQLite exposes the last auto-generated PK via :attr:`cursor.lastrowid`.
-psycopg3 does not. For the three tables where ``kanban_db.py`` reads
-``lastrowid`` (``task_runs``, ``task_comments``, ``task_events``) we
+psycopg3 does not. For the tables where ``kanban_db.py`` reads
+``lastrowid`` (``task_runs``, ``task_comments``, ``task_events``,
+``task_attachments``) we
 append ``RETURNING id`` to bare ``INSERT INTO <table>`` statements when
 the caller is the Postgres path. The wrapper then exposes the returned
 id as ``cursor.lastrowid`` so caller code doesn't change.
@@ -307,7 +308,7 @@ def translate_sqlite_master(
 # ``RETURNING id`` so psycopg3 captures the value. See the wrapper in
 # :mod:`.connection`.
 AUTOINCREMENT_TABLES: frozenset[str] = frozenset(
-    {"task_runs", "task_comments", "task_events"}
+    {"task_runs", "task_comments", "task_events", "task_attachments"}
 )
 
 _RE_INSERT_TARGET = re.compile(

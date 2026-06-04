@@ -81,6 +81,7 @@ _COPY_ORDER: Sequence[str] = (
     "task_runs",
     "task_events",
     "task_comments",
+    "task_attachments",
     "kanban_notify_subs",
 )
 
@@ -116,6 +117,10 @@ _CANONICAL_COLUMNS: dict[str, list[str]] = {
     "task_comments": [
         "id", "task_id", "author", "body", "created_at",
     ],
+    "task_attachments": [
+        "id", "task_id", "filename", "stored_path", "content_type",
+        "size", "uploaded_by", "created_at",
+    ],
     "kanban_notify_subs": [
         "task_id", "platform", "chat_id", "thread_id", "user_id",
         "notifier_profile", "created_at", "last_event_id",
@@ -125,7 +130,7 @@ _CANONICAL_COLUMNS: dict[str, list[str]] = {
 # Tables with an autoincrement ``id`` whose PG sequence we must
 # fast-forward after copying.
 _AUTOINCREMENT_TABLES: frozenset[str] = frozenset(
-    {"task_runs", "task_events", "task_comments"}
+    {"task_runs", "task_events", "task_comments", "task_attachments"}
 )
 
 # Match the connection wrapper.
