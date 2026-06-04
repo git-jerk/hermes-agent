@@ -213,6 +213,12 @@ TOOLSETS = {
         ],
         "includes": []
     },
+
+    "credential_csw": {
+        "description": "Profile-scoped 1Password CSW browser credential fill tools",
+        "tools": ["credential_csw_browser_fill"],
+        "includes": []
+    },
     
     "cronjob": {
         "description": "Cronjob management tool - create, list, update, pause, resume, remove, and trigger scheduled tasks",

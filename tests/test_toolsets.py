@@ -121,6 +121,13 @@ class TestValidateToolset:
         assert validate_toolset("web") is True
         assert validate_toolset("terminal") is True
 
+    def test_credential_csw_valid_before_dynamic_discovery(self):
+        assert validate_toolset("credential_csw") is True
+        assert resolve_toolset("credential_csw") == ["credential_csw_browser_fill"]
+
+    def test_all_alias_valid(self):
+        assert validate_toolset("all") is True
+        assert validate_toolset("*") is True
 
     def test_invalid(self):
         assert validate_toolset("nonexistent") is False
