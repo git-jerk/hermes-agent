@@ -865,16 +865,31 @@ def _recoverable_oneshot_run_at(
     return None
 
 
-def _compute_grace_seconds(schedule: dict) -> int:
+def _compute_grace_seconds(schedule: dict, job: Optional[Dict[str, Any]] = None) -> int:
     """Compute how late a job can be and still catch up instead of fast-forwarding.
 
     Uses half the schedule period (via ``_schedule_cadence_seconds``, the
     single cadence-measurement implementation), clamped between 120 seconds
-    and 2 hours.  This ensures daily jobs can catch up if missed by up to
-    2 hours, while frequent jobs (every 5-10 min) still fast-forward quickly.
+    and 2 hours. A job may opt into a larger ``stale_grace_seconds`` window for
+    short, safe, idempotent watchdogs that would otherwise starve when a long
+    cron job holds the scheduler tick lock across their narrow 5-minute window.
     """
     MIN_GRACE = 120
     MAX_GRACE = 7200  # 2 hours
+
+    if job:
+        configured_grace = job.get("stale_grace_seconds")
+        if configured_grace is not None:
+            try:
+                configured = int(configured_grace)
+                if configured > 0:
+                    return max(MIN_GRACE, min(configured, MAX_GRACE))
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Ignoring invalid stale_grace_seconds=%r for cron job %r",
+                    configured_grace,
+                    job.get("id"),
+                )
 
     period_seconds = _schedule_cadence_seconds(schedule)
     if not period_seconds:
@@ -3409,7 +3424,7 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                 # For recurring jobs, check if the scheduled time is stale
                 # (gateway was down and missed the window). Fast-forward to
                 # the next future occurrence instead of firing a stale run.
-                grace = _compute_grace_seconds(schedule)
+                grace = _compute_grace_seconds(schedule, job)
                 if kind in {"cron", "interval"} and (now - next_run_dt).total_seconds() > grace:
                     # Job is past its catch-up grace window — skip accumulated
                     # missed runs but still execute once now to avoid deferring

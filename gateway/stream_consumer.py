@@ -40,6 +40,52 @@ from gateway.response_filters import (
 
 logger = logging.getLogger("gateway.stream_consumer")
 
+_CONTEXT_SUMMARY_PREFIXES = (
+    "[CONTEXT COMPACTION — REFERENCE ONLY]",
+    "[CONTEXT SUMMARY]:",
+)
+
+_SCRATCHPAD_COMMENTARY_PATTERNS = (
+    r"^need\s+(?:to\s+)?[a-z0-9_/.-]+",
+    r"^maybe\s+",
+    r"^wait[.!?]?\s*$",
+    r"^submit\s+form[.!?]?\s*$",
+    r"^button\s+maybe\b",
+    r"^our\s+cdp[-_ ]eval\b",
+)
+
+
+def _looks_like_context_summary_leak(text: str) -> bool:
+    """Return True for internal compaction handoffs accidentally streamed.
+
+    Context summaries are model input/replay state, not user-visible assistant
+    content. If a compressed session is resumed or a model regurgitates the
+    handoff prefix, the gateway must fail closed and avoid publishing it to
+    Matrix/Telegram/etc.  The summary remains in internal history; this only
+    guards platform delivery.
+    """
+    stripped = (text or "").lstrip()
+    return any(stripped.startswith(prefix) for prefix in _CONTEXT_SUMMARY_PREFIXES)
+
+
+def _looks_like_scratchpad_commentary(text: str) -> bool:
+    """Detect terse inter-tool-call scratch/debug notes.
+
+    This deliberately applies only to commentary segments, not final answers:
+    a final user-facing reply can legitimately start with words like "Need".
+    The observed Matrix hygiene failure was interim commentary such as
+    "Need open orders search" or "Submit form" becoming standalone messages.
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    if _looks_like_context_summary_leak(stripped):
+        return True
+    if len(stripped) > 220 or "\n" in stripped:
+        return False
+    lowered = stripped.lower()
+    return any(re.match(pattern, lowered) for pattern in _SCRATCHPAD_COMMENTARY_PATTERNS)
+
 # Sentinel to signal the stream is complete
 _DONE = object()
 _NEW_SEGMENT = object()
@@ -556,7 +602,7 @@ class GatewayStreamConsumer:
 
     def on_commentary(self, text: str) -> None:
         """Queue a completed interim assistant commentary message."""
-        if text:
+        if text and not _looks_like_scratchpad_commentary(text):
             self._queue.put((_COMMENTARY, text))
 
     def flush_pending_sync(self, timeout: float = 5.0) -> bool:
@@ -1034,6 +1080,25 @@ class GatewayStreamConsumer:
                 ):
                     should_edit = False
                 if should_edit and self._accumulated:
+                    if _looks_like_context_summary_leak(self._accumulated):
+                        logger.warning(
+                            "suppressed internal context-summary leak before platform delivery (chat=%s)",
+                            self.chat_id,
+                        )
+                        self._accumulated = ""
+                        self._last_sent_text = ""
+                        if got_done:
+                            # Nothing user-facing remains to deliver for this
+                            # stream; do not fall through to the generic final
+                            # send path with the leaked summary.
+                            self._final_response_sent = False
+                            self._final_content_delivered = False
+                            return
+                        if got_segment_break:
+                            self._reset_segment_state(preserve_no_edit=True)
+                        self._last_edit_time = time.monotonic()
+                        continue
+
                     # Split overflow: if accumulated text exceeds the platform
                     # limit, split into properly sized chunks.
                     if (

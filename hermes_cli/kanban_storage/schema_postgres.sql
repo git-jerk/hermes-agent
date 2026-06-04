@@ -48,6 +48,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     skills               TEXT,
     model_override       TEXT,
     max_retries          BIGINT,
+    goal_mode            BIGINT NOT NULL DEFAULT 0,
+    goal_max_turns       BIGINT,
     session_id           TEXT
 );
 

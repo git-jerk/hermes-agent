@@ -3723,6 +3723,8 @@ def _read_codex_tokens_from_1p(auth_store: Optional[Dict[str, Any]] = None) -> O
     See workspace/references/codex-oauth-broker-policy-2026-05-29.md for
     the phased migration plan.
     """
+    if os.environ.get("HERMES_DISABLE_CODEX_1P") == "1" or os.environ.get("PYTEST_CURRENT_TEST"):
+        return None
     try:
         import sys as _sys
         lib_path = "/Users/minimiah/.openclaw/workspace/LAWS_GUARDS"

@@ -30464,10 +30464,14 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             )
             return False
 
-    # Sync bundled skills on gateway start (fast -- skips unchanged)
+    # Sync bundled skills on gateway start (fast -- skips unchanged), unless this
+    # profile explicitly opted out via `hermes profile create --no-skills`.
+    # Domain/fixer profiles rely on `.no-bundled-skills` to stay lean; ignoring
+    # it here silently re-seeds broad skill bundles on every gateway restart.
     try:
-        from tools.skills_sync import sync_skills
-        sync_skills(quiet=True)
+        if not (get_hermes_home() / ".no-bundled-skills").exists():
+            from tools.skills_sync import sync_skills
+            sync_skills(quiet=True)
     except Exception:
         pass
 

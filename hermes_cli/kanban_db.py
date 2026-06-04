@@ -2969,6 +2969,9 @@ _REBUILD_SPECS = {
 
 def _table_has_drifted(conn: sqlite3.Connection, table: str) -> bool:
     """True when ``table`` still carries the legacy (pre-AUTOINCREMENT) shape."""
+    config = _conn_config(conn)
+    if config is not None and config.backend != "sqlite":
+        return False
     info = conn.execute(f"PRAGMA table_info({table})").fetchall()
     if not info:
         return False  # table absent — nothing to rebuild

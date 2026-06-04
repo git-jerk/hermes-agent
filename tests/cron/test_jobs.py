@@ -697,6 +697,57 @@ class TestGetDueJobs:
         assert nxt > _hermes_now()
 
 
+    def test_stale_repeat_limited_job_consumes_one_run_on_catchup(self, tmp_cron_dir, monkeypatch):
+        """#33315 behavior note: a stale recurring job with a repeat.times limit
+        fires ONCE on catch-up and consumes one of its runs (it is no longer
+        silently skipped). Pins the documented repeat-count interaction so it
+        isn't changed accidentally."""
+        from cron.jobs import _hermes_now
+        job = create_job(prompt="Limited", schedule="every 5m", repeat=3)
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = (_hermes_now() - timedelta(minutes=11)).isoformat()
+        jobs[0]["last_run_at"] = (_hermes_now() - timedelta(minutes=11)).isoformat()
+        save_jobs(jobs)
+
+        # The stale job is returned to fire once (not skipped).
+        due = get_due_jobs()
+        assert [j["id"] for j in due] == [job["id"]]
+        # Simulate the run completing: mark_job_run increments completed.
+        mark_job_run(job["id"], True)
+        survived = get_job(job["id"])
+        assert survived is not None, "job should survive (3 > 1 completed)"
+        assert survived["repeat"]["completed"] == 1
+    def test_job_specific_stale_grace_prevents_short_watchdog_starvation(self, tmp_cron_dir):
+        """A short idempotent watchdog can opt into a larger catch-up window.
+
+        Five-minute jobs normally have a 150s stale window. When a long cron
+        tick holds the scheduler lock, a quick watchdog can be 4 minutes late
+        without representing a restart backlog; stale_grace_seconds keeps it due.
+        """
+        job = create_job(prompt="Short watchdog", schedule="every 5m")
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = (datetime.now() - timedelta(minutes=4)).isoformat()
+        jobs[0]["stale_grace_seconds"] = 900
+        save_jobs(jobs)
+
+        due = get_due_jobs()
+        assert [item["id"] for item in due] == [job["id"]]
+
+    def test_future_not_returned(self, tmp_cron_dir):
+        create_job(prompt="Not yet", schedule="every 1h")
+        due = get_due_jobs()
+        assert len(due) == 0
+
+    def test_disabled_not_returned(self, tmp_cron_dir):
+        job = create_job(prompt="Disabled", schedule="every 1h")
+        jobs = load_jobs()
+        jobs[0]["enabled"] = False
+        jobs[0]["next_run_at"] = (datetime.now() - timedelta(minutes=5)).isoformat()
+        save_jobs(jobs)
+
+        due = get_due_jobs()
+        assert len(due) == 0
+
     def test_broken_recent_one_shot_without_next_run_is_recovered(self, tmp_cron_dir, monkeypatch):
         now = datetime(2026, 3, 18, 4, 22, 30, tzinfo=timezone.utc)
         monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
@@ -992,10 +1043,10 @@ class TestPerJobScanContainment:
         import cron.jobs as jobs_mod
         real_grace = jobs_mod._compute_grace_seconds
 
-        def selective_grace(schedule):
+        def selective_grace(schedule, job=None):
             if schedule.get("minutes") == 7:
                 raise RuntimeError("simulated unforeseen malformed field")
-            return real_grace(schedule)
+            return real_grace(schedule, job)
 
         with mock_patch.object(jobs_mod, "_compute_grace_seconds", selective_grace):
             due = get_due_jobs()  # must not raise

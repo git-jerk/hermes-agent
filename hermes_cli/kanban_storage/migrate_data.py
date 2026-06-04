@@ -99,7 +99,8 @@ _CANONICAL_COLUMNS: dict[str, list[str]] = {
         "idempotency_key", "consecutive_failures", "worker_pid",
         "last_failure_error", "max_runtime_seconds", "last_heartbeat_at",
         "current_run_id", "workflow_template_id", "current_step_key",
-        "skills", "model_override", "max_retries", "session_id",
+        "skills", "model_override", "max_retries",
+        "goal_mode", "goal_max_turns", "session_id",
     ],
     "task_links": ["parent_id", "child_id"],
     "task_runs": [
