@@ -115,6 +115,7 @@ the `mistralai 2.4.6` worm on PyPI. Every direct dep is pinned to
 | `py.PyJWT` | 2.12.1 | 🔒 | frozen | `pyproject.toml` |
 | `py.tzdata` | 2025.3 | 🔒 | frozen | `pyproject.toml` |
 | `py.psutil` | 7.2.2 | 🔒 | frozen | `pyproject.toml` |
+| `py.pathspec` | 1.1.1 | 🔒 | frozen | `pyproject.toml` |
 
 **Refresh command:**
 

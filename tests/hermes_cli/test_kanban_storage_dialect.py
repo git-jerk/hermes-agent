@@ -234,7 +234,7 @@ class TestSqliteMaster:
 class TestReturningInjection:
     def test_autoincrement_tables_are_known(self):
         assert AUTOINCREMENT_TABLES == frozenset(
-            {"task_runs", "task_comments", "task_events"}
+            {"task_runs", "task_comments", "task_events", "task_attachments"}
         )
 
     def test_bare_insert_into_autoincrement_needs_returning(self):

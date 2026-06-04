@@ -374,6 +374,7 @@ def _register_builtin_probes() -> None:
         ("PyJWT", "2.12.1", "JWT signing (Skills Hub GitHub App; CVE-2026-32597 fix)"),
         ("tzdata", "2025.3", "Windows IANA timezone data (Windows-only conditional)"),
         ("psutil", "7.2.2", "Cross-platform process management"),
+        ("pathspec", "1.1.1", ".gitignore-aware file matching for desktop build stamps"),
     ]
     _live_pins = _load_pyproject_core_pins()
     for pkg, snapshot_ver, desc in _CORE_DEPS:
