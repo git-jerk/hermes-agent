@@ -111,11 +111,14 @@ the `mistralai 2.4.6` worm on PyPI. Every direct dep is pinned to
 | `py.pydantic` | 2.13.4 | 🔒 | frozen | `pyproject.toml` |
 | `py.prompt_toolkit` | 3.0.52 | 🔒 | frozen | `pyproject.toml` |
 | `py.croniter` | 6.0.0 | 🔒 | frozen | `pyproject.toml` |
+| `py.packaging` | 26.0 | 🔒 | frozen | `pyproject.toml` |
+| `py.Markdown` | 3.10.2 | 🔒 | frozen | `pyproject.toml` |
 | `py.psycopg` | 3.3.4 | 🔒 | frozen | `pyproject.toml` |
-| `py.PyJWT` | 2.12.1 | 🔒 | frozen | `pyproject.toml` |
+| `py.PyJWT` | 2.13.0 | 🔒 | frozen | `pyproject.toml` |
 | `py.tzdata` | 2025.3 | 🔒 | frozen | `pyproject.toml` |
 | `py.psutil` | 7.2.2 | 🔒 | frozen | `pyproject.toml` |
 | `py.pathspec` | 1.1.1 | 🔒 | frozen | `pyproject.toml` |
+| `py.Pillow` | 12.2.0 | 🔒 | frozen | `pyproject.toml` |
 
 **Refresh command:**
 
@@ -125,7 +128,8 @@ python3 -c "import tomllib; d=tomllib.load(open('pyproject.toml','rb')); [print(
 
 # Compare each pin to PyPI latest. Loop variant for paste-in:
 for pkg in openai python-dotenv fire httpx rich tenacity pyyaml ruamel.yaml \
-           requests jinja2 pydantic prompt_toolkit croniter psycopg PyJWT tzdata psutil; do
+           requests jinja2 pydantic prompt_toolkit croniter packaging Markdown \
+           psycopg PyJWT tzdata psutil pathspec Pillow; do
     latest=$(curl -s "https://pypi.org/pypi/${pkg}/json" \
         | python3 -c 'import json,sys; print(json.load(sys.stdin)["info"]["version"])' 2>/dev/null)
     pinned=$(grep -oE "^\s*\"${pkg}==[^\"]+\"" pyproject.toml | head -1)
@@ -133,9 +137,9 @@ for pkg in openai python-dotenv fire httpx rich tenacity pyyaml ruamel.yaml \
 done
 ```
 
-**Notes:** CVE-tracked entries (`requests` 2.33.0 for CVE-2026-25645,
-`PyJWT` 2.12.1 for CVE-2026-32597) cite the fix CVE in the pyproject
-comment. When bumping, include the equivalent reason in the commit
+**Notes:** CVE/PYSEC-tracked entries (`requests` 2.33.0 for CVE-2026-25645,
+`PyJWT` 2.13.0 for PYSEC-2026-175/177/178/179) cite the fix reason in the
+pyproject comment. When bumping, include the equivalent reason in the commit
 message.
 
 ---

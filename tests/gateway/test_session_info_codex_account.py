@@ -1,9 +1,8 @@
-from gateway.run import GatewayRunner
-
-
 def test_format_session_info_shows_sanitized_codex_account(monkeypatch):
     from gateway import run as gateway_run
     from agent import model_metadata
+
+    GatewayRunner = gateway_run.GatewayRunner
 
     monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda: "gpt-5.5")
     monkeypatch.setattr(
@@ -36,6 +35,8 @@ def test_format_session_info_shows_sanitized_codex_account(monkeypatch):
 def test_format_session_info_omits_codex_account_for_non_codex_provider(monkeypatch):
     from gateway import run as gateway_run
     from agent import model_metadata
+
+    GatewayRunner = gateway_run.GatewayRunner
 
     monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda: "claude-sonnet-4-6")
     monkeypatch.setattr(

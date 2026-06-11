@@ -34,7 +34,83 @@ def test_known_assignees_include_configured_claude_code_lanes(kanban_home, monke
     assert "claude-code" in names
     assert "claude-review" in names
     assert names["claude-review"]["on_disk"] is False
+    assert names["claude-review"]["external"] is True
+    assert names["claude-review"]["kind"] == "external"
     assert names["claude-review"]["counts"] == {}
+
+
+def test_configured_assignees_falls_back_to_root_config_from_profile_home(tmp_path, monkeypatch):
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "fixer"
+    profile.mkdir(parents=True)
+    (root / "config.yaml").write_text(
+        """
+kanban:
+  claude_code:
+    enabled: true
+    assignees: [claude-code, claude-review]
+    command: /Users/minimiah/.hermes/scripts/claude-csw
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    (profile / "config.yaml").write_text(
+        """
+kanban:
+  claude_code:
+    enabled: false
+    assignees: []
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+
+    assert kcc.is_configured_lane("claude-review") is True
+    assert kcc.is_configured_lane("claude-code") is True
+    assert kcc.get_claude_code_config()["command"] == "/Users/minimiah/.hermes/scripts/claude-csw"
+
+    kb.init_db()
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="review via claude", assignee="claude-review")
+        result = kb.dispatch_once(conn, dry_run=True)
+
+    assert (tid, "claude-review", "") in result.spawned
+    assert tid not in result.skipped_nonspawnable
+
+
+def test_profile_claude_code_config_keeps_root_assignees_visible(tmp_path, monkeypatch):
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "fixer"
+    profile.mkdir(parents=True)
+    (root / "config.yaml").write_text(
+        """
+kanban:
+  claude_code:
+    enabled: true
+    assignees: [claude-review]
+    command: claude-root
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    (profile / "config.yaml").write_text(
+        """
+kanban:
+  claude_code:
+    enabled: true
+    assignees: [profile-local]
+    command: claude-profile
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+
+    cfg = kcc.get_claude_code_config()
+
+    assert kcc.configured_assignees() == {"claude-review", "profile-local"}
+    assert cfg["command"] == "claude-profile"
 
 
 def test_parse_claude_bg_session_id_from_current_cli_output():
@@ -62,6 +138,9 @@ def test_detect_claude_auth_failure_from_logs():
     assert kcc.detect_claude_auth_failure("Claude Code\nPlease run /login first") is not None
     assert kcc.detect_claude_auth_failure("Claude Code authentication failed:\n401 Unauthorized") is not None
     assert kcc.detect_claude_auth_failure("Please run /login first") is not None
+    assert kcc.detect_claude_auth_failure(
+        "Please run /login · API Error: 401 Invalid authentication credentials"
+    ) is not None
     assert kcc.detect_claude_auth_failure("pytest\nPlease run /login first") is not None
     assert kcc.detect_claude_auth_failure("Please run /login first\npytest") is not None
     assert kcc.detect_claude_auth_failure("Claude Code needs authentication\npytest captured previous output") is not None

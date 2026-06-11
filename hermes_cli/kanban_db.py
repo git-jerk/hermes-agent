@@ -12141,7 +12141,9 @@ def list_configured_external_assignees() -> list[str]:
 def known_assignees(conn: sqlite3.Connection) -> list[dict]:
     """Return every assignee name known to the board, config, or disk.
 
-    Each entry is ``{"name": str, "on_disk": bool, "counts": {status: n}}``.
+    Each entry is
+    ``{"name": str, "on_disk": bool, "external": bool, "kind": str,
+    "counts": {status: n}}``.
     A name is included when it's a configured profile on disk, a configured
     external worker lane (for example Claude Code ``--bg``), OR when any
     non-archived task has it as the assignee. Used by:
@@ -12169,6 +12171,14 @@ def known_assignees(conn: sqlite3.Connection) -> list[dict]:
         {
             "name": name,
             "on_disk": name in on_disk,
+            "external": name in external,
+            "kind": (
+                "profile"
+                if name in on_disk
+                else "external"
+                if name in external
+                else "missing"
+            ),
             "counts": counts.get(name, {}),
         }
         for name in names

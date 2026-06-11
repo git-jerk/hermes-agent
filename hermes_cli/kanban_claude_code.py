@@ -22,6 +22,8 @@ import time
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
+import yaml
+
 from hermes_cli import kanban_db as kb
 
 
@@ -63,6 +65,11 @@ _STANDALONE_LOGIN_PROMPT_RE = re.compile(
     r"^\s*(?:(?:please\s+)?run\s+)?/login(?:\s+first)?\s*[.!:]?\s*$",
     re.IGNORECASE,
 )
+_CLI_LOGIN_AUTH_FAILURE_RE = re.compile(
+    r"(?:\bplease\s+run\s+/login\b.*\b(?:api\s+error|401|unauthori[sz]ed|invalid\s+authentication|credentials)\b|"
+    r"\b(?:api\s+error|401|unauthori[sz]ed|invalid\s+authentication|credentials)\b.*\bplease\s+run\s+/login\b)",
+    re.IGNORECASE,
+)
 _BENIGN_TEST_CONTEXT_RE = re.compile(
     r"\b(?:pytest|expects?|expecting|expected|mock|fixture|test\s+server|sdk|client|proxy)\b",
     re.IGNORECASE,
@@ -79,6 +86,111 @@ _SESSION_ID_RE = re.compile(r"\bbackgrounded\s+[·•:\-]\s*([A-Za-z0-9_-]+)\b")
 _ATTACH_ID_RE = re.compile(r"\bclaude\s+attach\s+([A-Za-z0-9_-]+)\b")
 
 
+def _root_hermes_home_from_profile_env() -> Optional[Path]:
+    """Return the root Hermes home when this process is profile-scoped.
+
+    Kanban control-plane helpers are often launched from profile workers where
+    ``HERMES_HOME`` points at ``~/.hermes/profiles/<profile>``.  The shared
+    Kanban/Claude Code lane configuration lives in the root Hermes config, so a
+    profile-local dispatch would otherwise misclassify configured external lanes
+    such as ``claude-review`` as non-spawnable terminal assignees.
+    """
+    raw = os.environ.get("HERMES_HOME")
+    if not raw:
+        return None
+    home = Path(raw).expanduser().resolve()
+    parts = home.parts
+    try:
+        idx = parts.index("profiles")
+    except ValueError:
+        return None
+    if idx <= 0 or idx >= len(parts) - 1:
+        return None
+    return Path(*parts[:idx])
+
+
+def _load_root_claude_code_config() -> dict[str, Any]:
+    root_home = _root_hermes_home_from_profile_env()
+    if root_home is None:
+        return {}
+    config_path = root_home / "config.yaml"
+    try:
+        data = yaml.safe_load(config_path.read_text()) or {}
+    except Exception:
+        return {}
+    if not isinstance(data, Mapping):
+        return {}
+    kanban = data.get("kanban", {}) or {}
+    if not isinstance(kanban, Mapping):
+        return {}
+    raw = kanban.get("claude_code", {}) or {}
+    return dict(raw) if isinstance(raw, Mapping) else {}
+
+
+def _load_profile_claude_code_config() -> dict[str, Any]:
+    raw_home = os.environ.get("HERMES_HOME")
+    if not raw_home or _root_hermes_home_from_profile_env() is None:
+        return {}
+    config_path = Path(raw_home).expanduser() / "config.yaml"
+    try:
+        data = yaml.safe_load(config_path.read_text()) or {}
+    except Exception:
+        return {}
+    if not isinstance(data, Mapping):
+        return {}
+    kanban = data.get("kanban", {}) or {}
+    if not isinstance(kanban, Mapping):
+        return {}
+    raw = kanban.get("claude_code", {}) or {}
+    return dict(raw) if isinstance(raw, Mapping) else {}
+
+
+def _merge_assignees(root_value: Any, profile_value: Any) -> Any:
+    """Merge Claude Code assignee rosters while preserving supported shapes."""
+    if isinstance(root_value, Mapping) or isinstance(profile_value, Mapping):
+        merged: dict[str, Any] = {}
+        if isinstance(root_value, Mapping):
+            merged.update(dict(root_value))
+        elif isinstance(root_value, str):
+            merged[root_value] = {}
+        elif root_value:
+            merged.update({str(name): {} for name in root_value if str(name).strip()})
+        if isinstance(profile_value, Mapping):
+            merged.update(dict(profile_value))
+        elif isinstance(profile_value, str):
+            merged[profile_value] = {}
+        elif profile_value:
+            merged.update({str(name): {} for name in profile_value if str(name).strip()})
+        return merged
+
+    names: list[str] = []
+    for raw in (root_value, profile_value):
+        if isinstance(raw, str):
+            seq = [raw]
+        else:
+            seq = raw or []
+        for name in seq:
+            text = str(name).strip()
+            if text and text not in names:
+                names.append(text)
+    return names
+
+
+def _merge_profile_and_root_claude_code_config(
+    profile_raw: Any,
+    root_raw: Mapping[str, Any],
+) -> dict[str, Any]:
+    profile = dict(profile_raw) if isinstance(profile_raw, Mapping) else {}
+    merged = dict(root_raw)
+    merged.update(profile)
+    merged["enabled"] = bool(root_raw.get("enabled") or profile.get("enabled"))
+    merged["assignees"] = _merge_assignees(
+        root_raw.get("assignees"),
+        profile.get("assignees"),
+    )
+    return merged
+
+
 def get_claude_code_config(config: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
     """Return merged ``kanban.claude_code`` config."""
     if config is None:
@@ -89,6 +201,17 @@ def get_claude_code_config(config: Optional[Mapping[str, Any]] = None) -> dict[s
         except Exception:
             root = {}
         raw = (root.get("kanban", {}) or {}).get("claude_code", {}) if isinstance(root, dict) else {}
+        # Profile-scoped workers inherit HERMES_HOME=~/.hermes/profiles/<name>,
+        # but the shared Kanban dispatcher and Claude Code lane roster live in
+        # the root Hermes config.  When root config is visible, keep its lane
+        # roster in scope even if the profile-local config is absent, disabled,
+        # or only partially overrides the Claude Code settings.
+        root_raw = _load_root_claude_code_config()
+        if root_raw.get("enabled"):
+            raw = _merge_profile_and_root_claude_code_config(
+                _load_profile_claude_code_config(),
+                root_raw,
+            )
     else:
         raw = dict(config)
 
@@ -170,6 +293,12 @@ def _line_has_claude_auth_failure(line: str) -> bool:
     """Return True when a single log line is a Claude/Anthropic auth failure."""
     if _STANDALONE_LOGIN_PROMPT_RE.search(line):
         return True
+    # Claude Code can emit the concrete failure as a bare UI line without the
+    # product name, e.g. "Please run /login · API Error: 401 Invalid
+    # authentication credentials". Treat that as auth failure, while still
+    # leaving app/test route mentions such as "GET /login returned 401" benign.
+    if _CLI_LOGIN_AUTH_FAILURE_RE.search(line):
+        return not _is_benign_auth_failure_line(line)
     if not (_AUTH_PRODUCT_RE.search(line) and _AUTH_FAILURE_RE.search(line)):
         return False
     return not _is_benign_auth_failure_line(line)

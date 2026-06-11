@@ -1254,6 +1254,42 @@ class GatewayKanbanWatchersMixin:
                 "on config control alone.", _lock_path,
             )
 
+        def _paused_board_slugs() -> set[str]:
+            raw_values: list[Any] = []
+            cfg_paused = kanban_cfg.get("dispatch_paused_boards")
+            if cfg_paused is None:
+                cfg_paused = kanban_cfg.get("paused_boards")
+            if isinstance(cfg_paused, str):
+                raw_values.extend(cfg_paused.split(","))
+            elif isinstance(cfg_paused, (list, tuple, set)):
+                raw_values.extend(cfg_paused)
+            env_paused = os.environ.get("HERMES_KANBAN_DISPATCH_PAUSED_BOARDS", "")
+            if env_paused:
+                raw_values.extend(env_paused.split(","))
+            paused: set[str] = set()
+            for raw in raw_values:
+                slug = str(raw or "").strip()
+                if not slug:
+                    continue
+                if slug in {"*", "all", "ALL"}:
+                    try:
+                        paused.update(
+                            (b.get("slug") or _kb.DEFAULT_BOARD)
+                            for b in _kb.list_boards(include_archived=False)
+                        )
+                    except Exception:
+                        paused.add(_kb.DEFAULT_BOARD)
+                else:
+                    paused.add(slug)
+            return paused
+
+        paused_dispatch_boards = _paused_board_slugs()
+        if paused_dispatch_boards:
+            logger.warning(
+                "kanban dispatcher: dispatch paused for boards=%s",
+                sorted(paused_dispatch_boards),
+            )
+
         try:
             interval = float(kanban_cfg.get("dispatch_interval_seconds", 60) or 60)
         except (ValueError, TypeError):
@@ -1533,6 +1569,13 @@ class GatewayKanbanWatchersMixin:
             out: list[tuple[str, "Optional[object]"]] = []
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
+                if slug in paused_dispatch_boards:
+                    logger.debug(
+                        "kanban dispatcher: board %s skipped because dispatch is paused",
+                        slug,
+                    )
+                    out.append((slug, None))
+                    continue
                 out.append((slug, _tick_once_for_board(slug)))
             return out
 
@@ -1561,6 +1604,8 @@ class GatewayKanbanWatchersMixin:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
+                if slug in paused_dispatch_boards:
+                    continue
                 conn = None
                 try:
                     conn = _kb.connect(board=slug)
@@ -1617,6 +1662,12 @@ class GatewayKanbanWatchersMixin:
             successes = 0
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
+                if slug in paused_dispatch_boards:
+                    logger.debug(
+                        "kanban auto-decompose [%s]: skipped because dispatch is paused",
+                        slug,
+                    )
+                    continue
                 if attempted >= auto_decompose_per_tick:
                     break
                 # Pin this board for the duration of the call — same

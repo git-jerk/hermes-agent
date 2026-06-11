@@ -503,6 +503,197 @@ def test_delete_task_removes_task_and_cascades(kanban_home):
 
 
 
+def test_dispatch_skips_unassigned(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="floater")
+        res = kb.dispatch_once(conn, dry_run=True)
+    assert t in res.skipped_unassigned
+    assert t not in res.skipped_nonspawnable
+    assert not res.spawned
+
+
+def test_dispatch_skips_nonspawnable_into_separate_bucket(kanban_home, monkeypatch):
+    """Tasks whose assignee fails profile_exists() must NOT land in
+    ``skipped_unassigned`` (which is operator-actionable) — they go in
+    the dedicated ``skipped_nonspawnable`` bucket so health telemetry
+    can suppress false-positive "stuck" warnings."""
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: False)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="for-terminal", assignee="orion-cc")
+        res = kb.dispatch_once(conn, dry_run=True)
+    assert t in res.skipped_nonspawnable
+    assert t not in res.skipped_unassigned
+    assert not res.spawned
+
+
+def test_dispatch_configured_claude_code_lane_is_spawnable_without_disk_profile(
+    kanban_home, monkeypatch,
+):
+    """Configured Claude Code lanes are external spawn backends, not typos."""
+    from hermes_cli import kanban_claude_code
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: False)
+    monkeypatch.setattr(
+        kanban_claude_code,
+        "is_configured_lane",
+        lambda assignee, config=None: assignee == "claude-review",
+    )
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="review via claude", assignee="claude-review")
+        res = kb.dispatch_once(conn, dry_run=True, default_assignee="codexworker")
+
+    assert (t, "claude-review", "") in res.spawned
+    assert t not in res.skipped_nonspawnable
+    assert t not in res.auto_assigned_default
+
+
+def test_has_spawnable_ready_false_when_only_terminal_lanes(kanban_home, monkeypatch):
+    """``has_spawnable_ready`` returns False when every ready task is
+    assigned to a control-plane lane — used by gateway/CLI dispatchers
+    to silence the stuck-warn while terminals still have queued work."""
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: False)
+    with kb.connect() as conn:
+        kb.create_task(conn, title="t1", assignee="orion-cc")
+        kb.create_task(conn, title="t2", assignee="orion-research")
+        assert kb.has_spawnable_ready(conn) is False
+
+
+def test_has_spawnable_ready_true_when_real_profile_present(kanban_home, monkeypatch):
+    """``has_spawnable_ready`` returns True as soon as ANY ready task
+    has an assignee that maps to a real Hermes profile — preserves the
+    real "stuck" signal when a daily/agent task is queued."""
+    from hermes_cli import profiles
+    monkeypatch.setattr(
+        profiles, "profile_exists", lambda name: name == "daily"
+    )
+    with kb.connect() as conn:
+        kb.create_task(conn, title="terminal-task", assignee="orion-cc")
+        kb.create_task(conn, title="hermes-task", assignee="daily")
+        assert kb.has_spawnable_ready(conn) is True
+
+
+def test_has_spawnable_ready_true_for_configured_claude_code_lane(
+    kanban_home, monkeypatch,
+):
+    from hermes_cli import kanban_claude_code
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: False)
+    monkeypatch.setattr(
+        kanban_claude_code,
+        "is_configured_lane",
+        lambda assignee, config=None: assignee == "claude-review",
+    )
+
+    with kb.connect() as conn:
+        kb.create_task(conn, title="review via claude", assignee="claude-review")
+        assert kb.has_spawnable_ready(conn) is True
+
+
+def test_has_spawnable_ready_false_on_empty_queue(kanban_home):
+    """Empty queue is the trivial false case — no ready tasks at all."""
+    with kb.connect() as conn:
+        assert kb.has_spawnable_ready(conn) is False
+
+
+def test_dispatch_promotes_ready_and_spawns(kanban_home, all_assignees_spawnable):
+    spawns = []
+
+    def fake_spawn(task, workspace):
+        spawns.append((task.id, task.assignee, workspace))
+
+    with kb.connect() as conn:
+        p = kb.create_task(conn, title="p", assignee="alice")
+        c = kb.create_task(conn, title="c", assignee="bob", parents=[p])
+        # Finish parent outside dispatch; promotion happens inside.
+        kb.complete_task(conn, p)
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+    # Spawned c (a was already done when dispatch was called).
+    assert len(spawns) == 1
+    assert spawns[0][0] == c
+    assert spawns[0][1] == "bob"
+    # c is now running
+    with kb.connect() as conn:
+        assert kb.get_task(conn, c).status == "running"
+
+
+def test_dispatch_spawn_failure_releases_claim(kanban_home, all_assignees_spawnable):
+    def boom(task, workspace):
+        raise RuntimeError("spawn failed")
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="boom", assignee="alice")
+        kb.dispatch_once(conn, spawn_fn=boom)
+        # Must return to ready so the next tick can retry.
+        assert kb.get_task(conn, t).status == "ready"
+        assert kb.get_task(conn, t).claim_lock is None
+
+
+def test_dispatch_max_spawn_counts_existing_running_tasks(
+    kanban_home, all_assignees_spawnable
+):
+    """max_spawn is a live concurrency cap, not a per-tick spawn cap.
+
+    Without counting tasks already in ``running``, every dispatcher tick can
+    launch up to ``max_spawn`` more workers while previous workers are still
+    alive. Long-running boards then accumulate unbounded worker subprocesses.
+    """
+    spawns = []
+
+    def fake_spawn(task, workspace):
+        spawns.append(task.id)
+
+    with kb.connect() as conn:
+        running_a = kb.create_task(conn, title="running-a", assignee="alice")
+        running_b = kb.create_task(conn, title="running-b", assignee="bob")
+        ready = kb.create_task(conn, title="ready", assignee="carol")
+        kb.claim_task(conn, running_a)
+        kb.claim_task(conn, running_b)
+
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=2)
+
+        assert res.spawned == []
+        assert spawns == []
+        assert kb.get_task(conn, ready).status == "ready"
+
+
+def test_dispatch_max_spawn_fills_remaining_capacity(
+    kanban_home, all_assignees_spawnable
+):
+    """When below cap, dispatch only fills available worker slots."""
+    spawns = []
+
+    def fake_spawn(task, workspace):
+        spawns.append(task.id)
+
+    with kb.connect() as conn:
+        running = kb.create_task(conn, title="running", assignee="alice")
+        ready_a = kb.create_task(conn, title="ready-a", assignee="bob")
+        ready_b = kb.create_task(conn, title="ready-b", assignee="carol")
+        kb.claim_task(conn, running)
+
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=2)
+
+        assert len(res.spawned) == 1
+        assert spawns == [ready_a]
+        assert kb.get_task(conn, ready_a).status == "running"
+        assert kb.get_task(conn, ready_b).status == "ready"
+
+
+def test_dispatch_reclaims_stale_before_spawning(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="alice")
+        kb.claim_task(conn, t)
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+            (int(time.time()) - 1, t),
+        )
+        res = kb.dispatch_once(conn, dry_run=True)
+    assert res.reclaimed == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1283,6 +1474,183 @@ def _set_task_status(conn: sqlite3.Connection, task_id: str, status: str) -> Non
 
 
 
+
+def test_dispatch_review_dry_run(kanban_home, all_assignees_spawnable):
+    """dispatch_once dry-run sees review tasks and reports them as spawned."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="review me", assignee="alice")
+        _set_task_status(conn, t, "review")
+        res = kb.dispatch_once(conn, dry_run=True)
+    assert len(res.spawned) == 1
+    assert res.spawned[0][0] == t
+    # Dry run must NOT mutate status.
+    with kb.connect() as conn:
+        assert kb.get_task(conn, t).status == "review"
+
+
+def test_dispatch_review_spawns_with_correct_skills(
+    kanban_home, all_assignees_spawnable,
+):
+    """Review tasks get sdlc-review skill set before spawning."""
+    spawned_tasks = []
+
+    def capture_spawn(task, workspace, board=None):
+        spawned_tasks.append(task)
+        return 42  # fake PID
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="review me", assignee="alice")
+        _set_task_status(conn, t, "review")
+        res = kb.dispatch_once(conn, spawn_fn=capture_spawn)
+    assert len(res.spawned) == 1
+    assert len(spawned_tasks) == 1
+    assert spawned_tasks[0].skills == ["sdlc-review"]
+
+
+def test_dispatch_review_skips_unassigned(kanban_home):
+    """Unassigned review tasks go to skipped_unassigned, not spawned."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="review floater")
+        _set_task_status(conn, t, "review")
+        res = kb.dispatch_once(conn, dry_run=True)
+    assert t in res.skipped_unassigned
+    assert not res.spawned
+
+
+def test_dispatch_review_counts_toward_max_spawn(
+    kanban_home, all_assignees_spawnable,
+):
+    """Review spawns count against max_spawn alongside ready tasks."""
+    spawns = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return 42
+
+    with kb.connect() as conn:
+        # Create 2 ready tasks + 1 review task, max_spawn=2
+        t1 = kb.create_task(conn, title="ready 1", assignee="alice")
+        t2 = kb.create_task(conn, title="ready 2", assignee="bob")
+        t3 = kb.create_task(conn, title="review", assignee="alice")
+        _set_task_status(conn, t3, "review")
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=2)
+    # Only 2 should spawn (ready tasks get priority in the loop)
+    assert len(res.spawned) == 2
+    assert len(spawns) == 2
+
+
+def test_dispatch_review_spawns_when_ready_empty(
+    kanban_home, all_assignees_spawnable,
+):
+    """When only review tasks exist, they still get dispatched."""
+    spawns = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return 42
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="review me", assignee="alice")
+        _set_task_status(conn, t, "review")
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+    assert len(res.spawned) == 1
+    assert spawns[0] == t
+
+
+def test_has_spawnable_review_true(kanban_home):
+    """has_spawnable_review returns True when review tasks exist with real profiles."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="review me", assignee="default")
+        _set_task_status(conn, t, "review")
+        # default profile should exist in the test env
+        assert kb.has_spawnable_review(conn) is True
+
+
+def test_has_spawnable_review_false_on_empty(kanban_home):
+    """has_spawnable_review returns False when no review tasks exist."""
+    with kb.connect() as conn:
+        assert kb.has_spawnable_review(conn) is False
+
+
+def test_has_spawnable_review_false_when_only_terminal_lanes(
+    kanban_home, monkeypatch,
+):
+    """has_spawnable_review returns False when review tasks are terminal lanes."""
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: False)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="review", assignee="orion-cc")
+        _set_task_status(conn, t, "review")
+        assert kb.has_spawnable_review(conn) is False
+
+
+def test_has_spawnable_review_true_for_configured_claude_code_lane(
+    kanban_home, monkeypatch,
+):
+    from hermes_cli import kanban_claude_code
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: False)
+    monkeypatch.setattr(
+        kanban_claude_code,
+        "is_configured_lane",
+        lambda assignee, config=None: assignee == "claude-review",
+    )
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="review", assignee="claude-review")
+        _set_task_status(conn, t, "review")
+        assert kb.has_spawnable_review(conn) is True
+
+
+def test_dispatch_review_configured_claude_code_lane_is_spawnable(
+    kanban_home, monkeypatch,
+):
+    from hermes_cli import kanban_claude_code
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: False)
+    monkeypatch.setattr(
+        kanban_claude_code,
+        "is_configured_lane",
+        lambda assignee, config=None: assignee == "claude-review",
+    )
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="review", assignee="claude-review")
+        _set_task_status(conn, t, "review")
+        res = kb.dispatch_once(conn, dry_run=True)
+
+    assert (t, "claude-review", "") in res.spawned
+    assert t not in res.skipped_nonspawnable
+
+
+def test_dispatch_review_skips_nonspawnable(kanban_home, monkeypatch):
+    """Review tasks with non-existent profiles go to skipped_nonspawnable."""
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: False)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="review", assignee="orion-cc")
+        _set_task_status(conn, t, "review")
+        res = kb.dispatch_once(conn, dry_run=True)
+    assert t in res.skipped_nonspawnable
+    assert not res.spawned
+
+
+def test_review_status_in_valid_statuses():
+    """'review' is a valid task status."""
+    assert "review" in kb.VALID_STATUSES
+
+
+def test_dispatch_review_does_not_claim_ready_tasks(
+    kanban_home, all_assignees_spawnable,
+):
+    """Review dispatch uses claim_review_task, which only claims review tasks."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="ready task", assignee="alice")
+        # claim_review_task should NOT claim a ready task
+        claimed = kb.claim_review_task(conn, t)
+    assert claimed is None
 
 # Stale detection — detect_stale_running
 # ---------------------------------------------------------------------------

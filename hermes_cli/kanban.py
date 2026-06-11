@@ -133,6 +133,47 @@ def _parse_branch_flag(value: Optional[str]) -> Optional[str]:
     return branch
 
 
+_DIRECT_KANBAN_PATH_ENV_KEYS = (
+    "HERMES_KANBAN_DB",
+    "HERMES_KANBAN_WORKSPACES_ROOT",
+    "HERMES_KANBAN_ATTACHMENTS_ROOT",
+)
+
+
+@contextlib.contextmanager
+def _without_direct_kanban_path_env():
+    """Temporarily ignore inherited direct Kanban path pins.
+
+    Kanban workers export ``HERMES_KANBAN_DB`` so subprocesses stay pinned to
+    their own task board. Operator-specified board operations are more explicit
+    than that inherited worker DB path; otherwise repair sessions accidentally
+    inspect, dispatch, or migrate the worker's board while believing they
+    targeted another board.
+    """
+    previous = {key: os.environ.get(key) for key in _DIRECT_KANBAN_PATH_ENV_KEYS}
+    try:
+        for key in _DIRECT_KANBAN_PATH_ENV_KEYS:
+            os.environ.pop(key, None)
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+@contextlib.contextmanager
+def _explicit_board_scope(slug: str):
+    """Pin an explicit CLI ``--board`` while ignoring inherited direct paths."""
+    with _without_direct_kanban_path_env():
+        with kb.scoped_current_board(slug):
+            yield
+
+
+def _check_dispatcher_presence() -> tuple[bool, str]:
+
+
 def _check_dispatcher_presence(
     hermes_home: Optional[Path] = None,
 ) -> tuple[bool, str]:
@@ -1152,10 +1193,19 @@ def kanban_command(args: argparse.Namespace) -> int:
     # reports beta as the current board even when the on-disk pointer is
     # alpha.
     if action == "boards":
-        return _dispatch_boards(args)
+        # Board management is global metadata. Ignore inherited worker DB pins so
+        # `boards create/list` does not report or initialize the caller's task DB
+        # for every board operation.
+        with _without_direct_kanban_path_env():
+            return _dispatch_boards(args)
 
     if action == "storage":
-        return _dispatch_storage(args)
+        # Storage management is board-explicit by nature (status/migrate one
+        # board or every board).  Ignore inherited worker direct-path pins so a
+        # profile-scoped repair shell cannot report/migrate the worker board for
+        # every listed slug.
+        with _without_direct_kanban_path_env():
+            return _dispatch_storage(args)
 
     # `--board <slug>` applies to every subcommand below by way of an
     # env-var pin for the duration of this call. Using HERMES_KANBAN_BOARD
@@ -1182,7 +1232,7 @@ def kanban_command(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-        board_scope = kb.scoped_current_board(normed)
+        board_scope = _explicit_board_scope(normed)
 
     # Auto-initialize the DB before dispatching any subcommand. init_db
     # is idempotent, so running it every invocation is cheap (one
@@ -1775,12 +1825,15 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
         print("(no assignees — create a profile with `hermes -p <name> setup`)")
         return 0
     # Header
-    print(f"{'NAME':20s}  {'ON DISK':8s}  COUNTS")
+    print(f"{'NAME':20s}  {'KIND':10s}  {'ON DISK':8s}  COUNTS")
     for entry in data:
         on_disk = "yes" if entry["on_disk"] else "no"
+        kind = entry.get("kind") or (
+            "profile" if entry["on_disk"] else "missing"
+        )
         counts = entry["counts"] or {}
         count_str = ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "(idle)"
-        print(f"{entry['name']:20s}  {on_disk:8s}  {count_str}")
+        print(f"{entry['name']:20s}  {kind:10s}  {on_disk:8s}  {count_str}")
     return 0
 
 

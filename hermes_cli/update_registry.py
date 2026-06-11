@@ -370,11 +370,14 @@ def _register_builtin_probes() -> None:
         ("pydantic", "2.13.4", "Data validation"),
         ("prompt_toolkit", "3.0.52", "Interactive CLI input (used directly by cli.py)"),
         ("croniter", "6.0.0", "Cron expression parser (built-in scheduler)"),
+        ("packaging", "26.0", "Version parsing for CLI/update/lazy-dependency checks"),
+        ("Markdown", "3.10.2", "Markdown to HTML conversion for rich message delivery"),
         ("psycopg", "3.3.4", "PostgreSQL driver (binary+pool extras; Kanban Postgres backend)"),
-        ("PyJWT", "2.12.1", "JWT signing (Skills Hub GitHub App; CVE-2026-32597 fix)"),
+        ("PyJWT", "2.13.0", "JWT signing (Skills Hub GitHub App; PYSEC-2026-175/177/178/179 fixes)"),
         ("tzdata", "2025.3", "Windows IANA timezone data (Windows-only conditional)"),
         ("psutil", "7.2.2", "Cross-platform process management"),
         ("pathspec", "1.1.1", ".gitignore-aware file matching for desktop build stamps"),
+        ("Pillow", "12.2.0", "Image resize recovery for oversized vision-tool images"),
     ]
     _live_pins = _load_pyproject_core_pins()
     for pkg, snapshot_ver, desc in _CORE_DEPS:
