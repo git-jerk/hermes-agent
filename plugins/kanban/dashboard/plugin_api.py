@@ -2794,11 +2794,15 @@ def get_orchestration_settings():
     resolved_orch = explicit_orch
     resolved_default = explicit_default
     try:
+        from hermes_cli import kanban_claude_code
         from hermes_cli import profiles as profiles_mod
         active_default = profiles_mod.get_active_profile_name() or "default"
         if not resolved_orch or not profiles_mod.profile_exists(resolved_orch):
             resolved_orch = active_default
-        if not resolved_default or not profiles_mod.profile_exists(resolved_default):
+        if not resolved_default or not (
+            profiles_mod.profile_exists(resolved_default)
+            or kanban_claude_code.is_configured_lane(resolved_default)
+        ):
             resolved_default = active_default
     except Exception:
         active_default = "default"
@@ -2840,8 +2844,10 @@ def set_orchestration_settings(payload: OrchestrationSettingsBody):
 
     # Validate any non-empty profile names exist before saving.
     try:
+        from hermes_cli import kanban_claude_code
         from hermes_cli import profiles as profiles_mod
     except Exception:
+        kanban_claude_code = None  # type: ignore
         profiles_mod = None  # type: ignore
 
     if payload.orchestrator_profile is not None:
@@ -2863,10 +2869,15 @@ def set_orchestration_settings(payload: OrchestrationSettingsBody):
         name = (payload.default_assignee or "").strip()
         if name and profiles_mod is not None:
             try:
-                if not profiles_mod.profile_exists(name):
+                is_profile = profiles_mod.profile_exists(name)
+                is_external_lane = bool(
+                    kanban_claude_code is not None
+                    and kanban_claude_code.is_configured_lane(name)
+                )
+                if not (is_profile or is_external_lane):
                     raise HTTPException(
                         status_code=400,
-                        detail=f"profile '{name}' does not exist",
+                        detail=f"profile or configured external lane '{name}' does not exist",
                     )
             except HTTPException:
                 raise

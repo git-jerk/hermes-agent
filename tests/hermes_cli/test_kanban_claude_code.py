@@ -60,6 +60,8 @@ kanban:
   claude_code:
     enabled: false
     assignees: []
+    command: claude-profile-disabled
+    unset_env: [ANTHROPIC_API_KEY]
 """.strip()
         + "\n",
         encoding="utf-8",

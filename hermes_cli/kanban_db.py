@@ -46,11 +46,12 @@ overrides still work:
 * ``HERMES_KANBAN_HOME`` — pin the umbrella root that anchors kanban
   paths. Useful for tests and unusual deployments.
 
-The dispatcher injects ``HERMES_KANBAN_DB``,
-``HERMES_KANBAN_WORKSPACES_ROOT``, and ``HERMES_KANBAN_BOARD`` into
-worker subprocess env so workers converge on the exact DB the
-dispatcher used to claim their task — even under unusual symlink or
-Docker layouts.
+The dispatcher injects ``HERMES_KANBAN_WORKSPACES_ROOT`` and
+``HERMES_KANBAN_BOARD`` into worker subprocess env. For SQLite-backed
+boards it also injects ``HERMES_KANBAN_DB`` as an exact file-path pin;
+for Postgres-backed boards it deliberately leaves that direct SQLite
+path unset so workers resolve the authoritative backend from the board
+slug/storage config.
 
 Schema is intentionally small: tasks, task_links, task_comments,
 task_events.  The ``workspace_kind`` field decouples coordination from git
@@ -8105,6 +8106,9 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+_NONSPAWNABLE_DISPATCH_SKIP_EVENT = "dispatch_skipped_nonspawnable"
+_NONSPAWNABLE_DISPATCH_COMMENT_AUTHOR = "kanban-dispatcher"
+
 
 @dataclass
 class DispatchResult:
@@ -8128,12 +8132,10 @@ class DispatchResult:
     operator can see when the dispatcher is acting on the fallback rule
     rather than on explicit per-task assignments."""
     skipped_nonspawnable: list[str] = field(default_factory=list)
-    """Ready task ids skipped because their assignee names a control-plane
-    lane (a Claude Code terminal like ``orion-cc``) rather than a Hermes
-    profile. Expected steady-state on multi-lane setups; NOT an
-    operator-actionable failure. Tracked separately so health telemetry
-    can distinguish "real stuck" (nothing spawned but spawnable work
-    available) from "correctly idle" (nothing spawnable in the queue)."""
+    """Ready/review task ids skipped because their assignee has no automatic
+    spawn backend (no Hermes profile and no configured external lane). This can
+    be an intentional manual lane or a routing typo; real dispatch passes add a
+    once-per-assignee card comment so the task does not silently sit in ready."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """Tasks deferred this tick because their assignee is already at
     ``kanban.max_in_progress_per_profile`` (#21582). Each entry is
@@ -9663,6 +9665,93 @@ def _assignee_spawnable(assignee: Optional[str], profile_exists=None) -> bool:
     return bool(profile_exists(assignee))
 
 
+def _nonspawnable_skip_recorded(
+    conn: sqlite3.Connection,
+    task_id: str,
+    assignee: str,
+) -> bool:
+    """Return True if this task/assignee skip was already annotated."""
+    rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+        "ORDER BY id DESC LIMIT 20",
+        (task_id, _NONSPAWNABLE_DISPATCH_SKIP_EVENT),
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else None
+        except Exception:
+            payload = None
+        if isinstance(payload, dict) and payload.get("assignee") == assignee:
+            return True
+    return False
+
+
+def _record_nonspawnable_dispatch_skip(
+    conn: sqlite3.Connection,
+    task_id: str,
+    assignee: Optional[str],
+    *,
+    status: str,
+) -> None:
+    """Leave a durable, once-per-assignee note for nonspawnable dispatch skips.
+
+    We still do not claim/spawn or auto-block here: missing profiles can also
+    be deliberate manual lanes. The hardening is that a ready/review task no
+    longer rots invisibly with only aggregate ``skipped_nonspawnable`` telemetry;
+    the card itself explains why automatic dispatch is not moving it.
+    """
+    assignee_text = (assignee or "").strip()
+    if not assignee_text:
+        return
+    if _nonspawnable_skip_recorded(conn, task_id, assignee_text):
+        return
+
+    body = (
+        f"dispatcher-skip: assignee {assignee_text!r} is not an existing "
+        "Hermes profile or configured external Kanban lane, so this task "
+        "will not auto-spawn. Reassign it to an existing Hermes profile, "
+        "create/configure that profile or external lane, or claim it manually "
+        "if this assignee is intentionally a manual lane."
+    )
+    try:
+        with write_txn(conn):
+            if _nonspawnable_skip_recorded(conn, task_id, assignee_text):
+                return
+            now = int(time.time())
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    task_id,
+                    _NONSPAWNABLE_DISPATCH_COMMENT_AUTHOR,
+                    body,
+                    now,
+                ),
+            )
+            _append_event(
+                conn,
+                task_id,
+                "commented",
+                {
+                    "author": _NONSPAWNABLE_DISPATCH_COMMENT_AUTHOR,
+                    "len": len(body),
+                },
+            )
+            _append_event(
+                conn,
+                task_id,
+                _NONSPAWNABLE_DISPATCH_SKIP_EVENT,
+                {"assignee": assignee_text, "status": status},
+            )
+    except Exception:
+        _log.debug(
+            "kanban dispatch: failed to annotate nonspawnable assignee %r on %s",
+            assignee_text,
+            task_id,
+            exc_info=True,
+        )
+
+
 def _claude_code_spawn(
     task: Task,
     workspace: str,
@@ -10233,13 +10322,17 @@ def _dispatch_once_locked(
             _per_profile_running[prow["assignee"]] = int(prow["n"])
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
-    # We also resolve profile_exists once here for the same reason.
+    # Resolve spawnability once here too: the fallback may be either a normal
+    # Hermes profile or a configured external lane such as Claude Code --bg.
     _default_assignee = (default_assignee or "").strip() or None
     _default_assignee_resolved = False
     if _default_assignee:
         try:
             from hermes_cli.profiles import profile_exists as _pe
-            _default_assignee_resolved = bool(_pe(_default_assignee))
+            _default_assignee_resolved = _assignee_spawnable(
+                _default_assignee,
+                profile_exists=_pe,
+            )
         except Exception:
             # Profiles module not importable (test stubs, exotic envs).
             # Trust the operator's config and try the assignment; the
@@ -10308,14 +10401,19 @@ def _dispatch_once_locked(
             from hermes_cli.profiles import profile_exists  # local import: avoids cycle
         except Exception:
             profile_exists = None  # type: ignore[assignment]
-        if not _assignee_spawnable(row["assignee"], profile_exists=profile_exists):
-            # Bucket separately from skipped_unassigned: the operator
-            # cannot fix this by assigning a profile (the assignee IS the
-            # intended owner — a terminal lane). Health telemetry uses
-            # this distinction to suppress spurious "stuck" warnings on
-            # multi-lane setups where the ready queue is steadily full
-            # of human-pulled work.
+        if not _assignee_spawnable(row_assignee, profile_exists=profile_exists):
+            # Bucket separately from skipped_unassigned: this has an assignee,
+            # but the dispatcher has no automatic spawn backend for that name.
+            # It may be an intentional manual lane or a routing typo. Annotate
+            # real passes once so the card itself explains why it is not moving.
             result.skipped_nonspawnable.append(row["id"])
+            if not dry_run:
+                _record_nonspawnable_dispatch_skip(
+                    conn,
+                    row["id"],
+                    row_assignee,
+                    status="ready",
+                )
             continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
@@ -10464,6 +10562,13 @@ def _dispatch_once_locked(
             profile_exists = None  # type: ignore[assignment]
         if not _assignee_spawnable(row["assignee"], profile_exists=profile_exists):
             result.skipped_nonspawnable.append(row["id"])
+            if not dry_run:
+                _record_nonspawnable_dispatch_skip(
+                    conn,
+                    row["id"],
+                    row["assignee"],
+                    status="review",
+                )
             continue
         if _per_profile_cap is not None:
             current = _per_profile_running.get(row["assignee"], 0)
@@ -10855,10 +10960,12 @@ def _default_spawn(
     via the ``complete`` / ``block`` transitions the worker writes itself;
     the PID check is a safety net for crashes, OOM kills, and Ctrl+C.
 
-    ``board`` pins the child's kanban context to that board: the child's
-    ``HERMES_KANBAN_DB`` / ``HERMES_KANBAN_BOARD`` / workspaces_root env
-    vars all resolve to the same board the dispatcher claimed the task
-    from. Workers cannot accidentally see other boards.
+    ``board`` pins the child's kanban context to that board. All workers get
+    ``HERMES_KANBAN_BOARD`` plus the board's workspace root; SQLite-backed
+    boards also get ``HERMES_KANBAN_DB`` as an exact file pin, while
+    Postgres-backed boards must leave that direct SQLite path unset so the
+    child resolves through the board slug/storage config. Workers cannot
+    accidentally see other boards.
     """
     import subprocess
     if not task.assignee:
@@ -10952,13 +11059,25 @@ def _default_spawn(
     # dispatcher's. Belt-and-braces with the `get_default_hermes_root()`
     # resolution in `kanban_home()` — symmetric resolution is the norm,
     # but unusual symlink / Docker layouts are caught here too.
-    env["HERMES_KANBAN_DB"] = str(kanban_db_path(board=board))
-    env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(workspaces_root(board=board))
+    resolved_board = _normalize_board_slug(board) or get_current_board()
+    storage_config = _resolve_storage_config(board=resolved_board)
+    if storage_config.backend == "sqlite":
+        # HERMES_KANBAN_DB is a direct SQLite path pin. Keep it for SQLite
+        # boards so workers preserve the legacy exact-file handoff, including
+        # explicit env overrides. For Postgres boards this would point at a
+        # stale vestigial sqlite file and hide the authoritative board backend
+        # from worker-side kanban_* tools, so we deliberately remove any
+        # inherited value below.
+        env["HERMES_KANBAN_DB"] = str(
+            storage_config.sqlite_path or kanban_db_path(board=resolved_board)
+        )
+    else:
+        env.pop("HERMES_KANBAN_DB", None)
+    env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(workspaces_root(board=resolved_board))
     _retag_legacy_worker_sessions(env["HERMES_KANBAN_WORKSPACES_ROOT"])
     # Board slug — the final defense-in-depth pin. If the worker ever
     # resolves kanban paths without the DB / workspaces env vars, the
     # board slug still forces it to the right directory.
-    resolved_board = _normalize_board_slug(board) or get_current_board()
     env["HERMES_KANBAN_BOARD"] = resolved_board
     # HERMES_PROFILE is the author the kanban_comment tool defaults to.
     # `hermes -p <assignee>` activates the profile, but the env var is

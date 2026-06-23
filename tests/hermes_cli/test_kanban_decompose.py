@@ -75,6 +75,72 @@ def _patch_list_profiles(names: list[str]):
     ]
 
 
+
+def test_decompose_default_assignee_can_be_configured_claude_code_lane(monkeypatch):
+    """External Claude Code lanes are valid defaults, not profile typos."""
+    monkeypatch.setattr(decomp.profiles_mod, "profile_exists", lambda name: False)
+    monkeypatch.setattr(decomp.profiles_mod, "get_active_profile_name", lambda: "default")
+    monkeypatch.setattr(
+        decomp.kanban_claude_code,
+        "is_configured_lane",
+        lambda assignee, config=None: assignee == "claude-code",
+    )
+
+    assert (
+        decomp._resolve_default_assignee(
+            {"kanban": {"default_assignee": "claude-code"}}
+        )
+        == "claude-code"
+    )
+
+
+def test_decompose_roster_includes_configured_claude_code_lanes(monkeypatch):
+    """The decomposer prompt may choose external Claude Code lanes directly."""
+    patches = _patch_list_profiles(["orchestrator", "engineer"])
+    for p in patches:
+        p.start()
+    monkeypatch.setattr(
+        decomp.kanban_claude_code,
+        "configured_assignees",
+        lambda config=None: {"claude-code", "claude-review"},
+    )
+    try:
+        roster, valid_names = decomp._build_roster()
+    finally:
+        for p in patches:
+            p.stop()
+
+    names = {entry["name"] for entry in roster}
+    assert {"orchestrator", "engineer", "claude-code", "claude-review"} <= names
+    assert {"claude-code", "claude-review"} <= valid_names
+    assert "claude --bg" in decomp._format_roster(roster)
+
+
+def test_decompose_generated_routing_reserves_codexworker_for_critical_review():
+    valid = {"claude-code", "claude-review", "codexworker"}
+    assert decomp._normalize_assignee_choice(
+        None,
+        title="Review routine patch",
+        body="Normal verification only.",
+        default_assignee="claude-code",
+        valid_names=valid,
+    ) == "claude-review"
+    assert decomp._normalize_assignee_choice(
+        "codexworker",
+        title="Review routine patch",
+        body="Normal verification only.",
+        default_assignee="claude-code",
+        valid_names=valid,
+    ) == "claude-review"
+    assert decomp._normalize_assignee_choice(
+        "codexworker",
+        title="Critical adversarial safety review",
+        body="Security and credential boundary check.",
+        default_assignee="claude-code",
+        valid_names=valid,
+    ) == "codexworker"
+
+
 def test_decompose_with_fanout_creates_children(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="ship a feature", triage=True)

@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_routing
 from hermes_cli import kanban_swarm as ks
 
 
@@ -1857,12 +1858,17 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    assignee = kanban_routing.card_creator_assignee(
+        args.assignee,
+        title=args.title,
+        body=args.body,
+    )
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,
             title=args.title,
             body=args.body,
-            assignee=args.assignee,
+            assignee=assignee,
             created_by=args.created_by or _profile_author(),
             workspace_kind=ws_kind,
             workspace_path=ws_path,
@@ -3015,8 +3021,14 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 f"Deferred ({who} at per-profile cap, {current} running): {tid}"
             )
     if res.skipped_nonspawnable:
+        annotation_note = (
+            "would annotate on real dispatch"
+            if getattr(args, "dry_run", False)
+            else "card annotated"
+        )
         print(
-            f"Skipped (non-spawnable assignee — terminal lane, OK): "
+            f"Skipped (non-spawnable assignee — no Hermes profile/configured lane; "
+            f"{annotation_note}): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
     return 0

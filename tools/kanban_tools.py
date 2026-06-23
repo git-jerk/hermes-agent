@@ -35,6 +35,7 @@ from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
+from hermes_cli import kanban_routing
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 
@@ -217,11 +218,12 @@ def _connect(board: Optional[str] = None):
     contexts (e.g. test rigs that import every tool module).
 
     When ``board`` is provided it's forwarded to :func:`kb.connect`, which
-    routes the connection to that board's sqlite file. ``None`` (the
-    default) preserves the legacy resolution chain
-    (``HERMES_KANBAN_DB`` → ``HERMES_KANBAN_BOARD`` env → current symlink
-    → ``default``). Per-tool ``board`` lets a Telegram-side agent override
-    the env-pinned active board without restarting Hermes.
+    routes the connection through that board's configured storage backend
+    (SQLite or Postgres). ``None`` (the default) preserves the legacy
+    resolution chain (direct SQLite ``HERMES_KANBAN_DB`` when applicable →
+    ``HERMES_KANBAN_BOARD`` env → current symlink → ``default``). Per-tool
+    ``board`` lets a Telegram-side agent override the env-pinned active board
+    without restarting Hermes.
     """
     from hermes_cli import kanban_db as kb
     return kb, kb.connect(board=board)
@@ -1352,12 +1354,11 @@ def _handle_create(args: dict, **kw) -> str:
     title = args.get("title")
     if not title or not str(title).strip():
         return tool_error("title is required")
-    assignee = args.get("assignee")
-    if not assignee:
-        return tool_error(
-            "assignee is required — name the profile that should execute this "
-            "task (the dispatcher will only spawn tasks with an assignee)"
-        )
+    assignee = kanban_routing.card_creator_assignee(
+        args.get("assignee"),
+        title=str(title).strip(),
+        body=args.get("body"),
+    )
     body = args.get("body")
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
@@ -1677,11 +1678,11 @@ _DESC_TASK_ID_DEFAULT = (
 
 _DESC_BOARD = (
     "Kanban board slug to target. When omitted, the call resolves the "
-    "active board the usual way: HERMES_KANBAN_DB env → "
-    "HERMES_KANBAN_BOARD env → the 'current' symlink under the kanban "
-    "home → 'default'. Pass an explicit slug only when the caller (e.g. "
-    "a Telegram routing layer) needs to override the env-pinned active "
-    "board for this one call."
+    "active board/backend the usual way: direct SQLite HERMES_KANBAN_DB "
+    "env when applicable → HERMES_KANBAN_BOARD env → the 'current' symlink "
+    "under the kanban home → 'default'. Pass an explicit slug only when "
+    "the caller (e.g. a Telegram routing layer) needs to override the "
+    "env-pinned active board for this one call."
 )
 
 
@@ -2137,7 +2138,11 @@ KANBAN_CREATE_SCHEMA = {
         "orchestrator workers to fan out — decompose work into child "
         "tasks with specific assignees, link them into a pipeline, "
         "then complete your own task. The dispatcher picks up the new "
-        "tasks on its next tick and spawns the assigned profiles."
+        "tasks on its next tick and spawns the assigned profiles. "
+        "Routing defaults: routine offline implementation/research/synthesis "
+        "goes to claude-code; routine review/verification goes to "
+        "claude-review; codexworker is reserved for critical adversarial "
+        "or safety/security review."
     ),
     "parameters": {
         "type": "object",
@@ -2149,10 +2154,12 @@ KANBAN_CREATE_SCHEMA = {
             "assignee": {
                 "type": "string",
                 "description": (
-                    "Profile name that should execute this task "
-                    "(e.g. 'researcher-a', 'reviewer', 'writer'). "
-                    "Required — tasks without an assignee are never "
-                    "dispatched."
+                    "Profile/lane name that should execute this task. "
+                    "Optional: if omitted, routine offline implementation, "
+                    "research, and synthesis default to 'claude-code'; "
+                    "routine review/verification defaults to 'claude-review'; "
+                    "use 'codexworker' only for critical adversarial or "
+                    "safety/security review. Explicit assignees are honored."
                 ),
             },
             "body": {
@@ -2305,7 +2312,7 @@ KANBAN_CREATE_SCHEMA = {
             },
             "board": _board_schema_prop(),
         },
-        "required": ["title", "assignee"],
+        "required": ["title"],
     },
 }
 

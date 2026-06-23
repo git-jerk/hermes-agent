@@ -85,6 +85,56 @@ def kanban_home(tmp_path, monkeypatch):
 
 
 
+def test_crash_gave_up_is_not_repromoted_in_same_dispatch_tick(
+    kanban_home, all_assignees_spawnable
+):
+    """A crash that trips the breaker must stay blocked after gave_up.
+
+    Regression for a live loop where attempt N crashed, ``gave_up`` was
+    emitted at the dispatcher failure limit, then the same dispatch tick's
+    ``recompute_ready`` promoted the card and allowed attempt N+1.
+    """
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="crash loop", assignee="worker")
+
+        for expected_failures in (1, 2):
+            claimed = kb.claim_task(conn, tid)
+            assert claimed is not None
+            kb._set_worker_pid(conn, tid, 2 ** 30 + expected_failures)
+
+            res = kb.dispatch_once(conn, dry_run=True, failure_limit=2)
+            task = kb.get_task(conn, tid)
+            assert task is not None
+
+            assert tid in res.crashed
+            assert task.consecutive_failures == expected_failures
+            if expected_failures == 1:
+                assert task.status == "ready"
+            else:
+                assert tid in res.auto_blocked
+                assert task.status == "blocked"
+                assert res.promoted == 0
+                assert tid not in [spawn[0] for spawn in res.spawned]
+
+        after_gave_up = kb.dispatch_once(conn, dry_run=True, failure_limit=2)
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        events = kb.list_events(conn, tid)
+        gave_up_index = max(
+            idx for idx, event in enumerate(events) if event.kind == "gave_up"
+        )
+        later_events = [event.kind for event in events[gave_up_index + 1:]]
+
+        assert task.status == "blocked"
+        assert after_gave_up.promoted == 0
+        assert tid not in [spawn[0] for spawn in after_gave_up.spawned]
+        assert "promoted" not in later_events
+        assert "claimed" not in later_events
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Daemon loop
 # ---------------------------------------------------------------------------
@@ -979,6 +1029,80 @@ def _make_create_ns(**overrides):
     for k, v in overrides.items():
         setattr(ns, k, v)
     return ns
+
+
+def test_cli_create_warns_when_no_gateway(kanban_home, monkeypatch, capsys):
+    """ready+assigned task + no gateway -> warning on stderr."""
+    from hermes_cli import kanban as kb_cli
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"dispatch_in_gateway": True}},
+    )
+    ns = _make_create_ns(title="warn-me", assignee="worker")
+    assert kb_cli._cmd_create(ns) == 0
+    captured = capsys.readouterr()
+    # Stderr has the warning prefix + guidance.
+    assert "hermes gateway start" in captured.err
+
+
+def test_cli_create_silent_when_gateway_up(kanban_home, monkeypatch, capsys):
+    """gateway running + dispatch enabled -> no warning."""
+    from hermes_cli import kanban as kb_cli
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: 4242)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"dispatch_in_gateway": True}},
+    )
+    ns = _make_create_ns(title="silent", assignee="worker")
+    assert kb_cli._cmd_create(ns) == 0
+    captured = capsys.readouterr()
+    assert "hermes gateway start" not in captured.err
+
+
+def test_cli_create_no_warn_on_triage(kanban_home, monkeypatch, capsys):
+    """Triage tasks can't be dispatched -> no warning."""
+    from hermes_cli import kanban as kb_cli
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"dispatch_in_gateway": True}},
+    )
+    ns = _make_create_ns(title="triage-task", assignee=None, triage=True)
+    assert kb_cli._cmd_create(ns) == 0
+    err = capsys.readouterr().err
+    assert "hermes gateway start" not in err
+
+
+def test_cli_create_routes_unassigned_and_warns(kanban_home, monkeypatch, capsys):
+    """Omitted assignee is now routed to the default lane (kanban_routing), so the
+    task is dispatchable -> gateway-down warning fires. Pre-routing-graft this was
+    'unassigned -> not dispatchable -> no warning'; the non-dispatchable case is now
+    triage (covered by test_cli_create_no_warn_on_triage)."""
+    from hermes_cli import kanban as kb_cli
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"dispatch_in_gateway": True}},
+    )
+    ns = _make_create_ns(title="nobody", assignee=None)
+    assert kb_cli._cmd_create(ns) == 0
+    err = capsys.readouterr().err
+    assert "hermes gateway start" in err
+
+
+def test_cli_daemon_without_force_prints_deprecation_exits_2(kanban_home, capsys):
+    """`hermes kanban daemon` (no --force) is a deprecation stub."""
+    from hermes_cli import kanban as kb_cli
+    ns = argparse.Namespace(
+        force=False, interval=60.0, max=None, failure_limit=3,
+        pidfile=None, verbose=False,
+    )
+    rc = kb_cli._cmd_daemon(ns)
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "DEPRECATED" in err
+    assert "hermes gateway start" in err
 
 
 def test_cli_daemon_help_marks_deprecated():

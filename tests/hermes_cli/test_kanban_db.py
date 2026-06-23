@@ -512,6 +512,60 @@ def test_dispatch_skips_unassigned(kanban_home):
     assert not res.spawned
 
 
+def test_dispatch_default_assignee_routes_unassigned_ready_task(
+    kanban_home, monkeypatch
+):
+    """``kanban.default_assignee`` should route unassigned ready work.
+
+    Regression coverage for the dispatch path that mutates ``row_assignee``
+    after reading the sqlite row: subsequent spawnability checks must use the
+    resolved fallback, not the original NULL row value.
+    """
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: name == "codexworker")
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="floater")
+        res = kb.dispatch_once(
+            conn,
+            dry_run=True,
+            default_assignee="codexworker",
+        )
+    assert (t, "codexworker", "") in res.spawned
+    assert t in res.auto_assigned_default
+    assert t not in res.skipped_unassigned
+    assert t not in res.skipped_nonspawnable
+
+
+
+def test_dispatch_default_assignee_routes_to_configured_claude_code_lane(
+    kanban_home, monkeypatch
+):
+    """The default fallback may be an external Claude Code --bg lane."""
+    from hermes_cli import kanban_claude_code
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: False)
+    monkeypatch.setattr(
+        kanban_claude_code,
+        "is_configured_lane",
+        lambda assignee, config=None: assignee == "claude-code",
+    )
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="floater")
+        res = kb.dispatch_once(
+            conn,
+            dry_run=True,
+            default_assignee="claude-code",
+        )
+
+    assert (t, "claude-code", "") in res.spawned
+    assert t in res.auto_assigned_default
+    assert t not in res.skipped_unassigned
+    assert t not in res.skipped_nonspawnable
+
+
 def test_dispatch_skips_nonspawnable_into_separate_bucket(kanban_home, monkeypatch):
     """Tasks whose assignee fails profile_exists() must NOT land in
     ``skipped_unassigned`` (which is operator-actionable) — they go in
@@ -525,6 +579,41 @@ def test_dispatch_skips_nonspawnable_into_separate_bucket(kanban_home, monkeypat
     assert t in res.skipped_nonspawnable
     assert t not in res.skipped_unassigned
     assert not res.spawned
+
+
+def test_dispatch_comments_once_when_nonspawnable_assignee_blocks_autospawn(
+    kanban_home, monkeypatch
+):
+    """A missing/nonspawnable assignee should not sit in ready silently.
+
+    The dispatcher still must not claim or spawn the task (manual/external
+    lanes remain possible), but a real dispatch pass should leave a durable
+    card comment explaining why automatic dispatch skipped it. The comment is
+    emitted once per assignee so repeated dispatcher ticks don't spam cards.
+    """
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: False)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="review queued for missing lane", assignee="dedra")
+
+        first = kb.dispatch_once(conn, dry_run=False)
+        second = kb.dispatch_once(conn, dry_run=False)
+
+        task = kb.get_task(conn, t)
+        comments = kb.list_comments(conn, t)
+
+    assert t in first.skipped_nonspawnable
+    assert t in second.skipped_nonspawnable
+    assert not first.spawned
+    assert not second.spawned
+    assert task.status == "ready"
+    dispatcher_comments = [c for c in comments if c.author == "kanban-dispatcher"]
+    assert len(dispatcher_comments) == 1
+    body = dispatcher_comments[0].body
+    assert "dedra" in body
+    assert "will not auto-spawn" in body
+    assert "existing Hermes profile" in body
 
 
 def test_dispatch_configured_claude_code_lane_is_spawnable_without_disk_profile(
@@ -1847,6 +1936,44 @@ def test_connect_sets_secure_delete_on(tmp_path):
 
 
 
+def test_connect_sets_synchronous_full(tmp_path):
+    """synchronous must be FULL (=2), not NORMAL (=1)."""
+    db_path = tmp_path / "kanban.db"
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with kb.connect(db_path=db_path) as conn:
+        row = conn.execute("PRAGMA synchronous").fetchone()
+    assert row[0] == 2, f"expected synchronous=2 (FULL), got {row[0]}"
+
+
+def test_connect_pragmas_applied_on_reconnect(tmp_path):
+    """All three pragmas must be re-applied on every connect(), not just the first."""
+    db_path = tmp_path / "kanban.db"
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    # First connection: write a task and close.
+    with kb.connect(db_path=db_path) as conn:
+        kb.create_task(conn, title="reconnect-check")
+    # Force re-init path by discarding path cache.
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    # Second connection: pragmas must still be applied.
+    with kb.connect(db_path=db_path) as conn:
+        assert conn.execute("PRAGMA secure_delete").fetchone()[0] == 1
+        assert conn.execute("PRAGMA cell_size_check").fetchone()[0] == 1
+        assert conn.execute("PRAGMA synchronous").fetchone()[0] == 2
+
+
+def test_pragmas_not_accidentally_disabled_by_migrate_path(tmp_path):
+    """Migration path must not reset connection pragmas."""
+    db_path = tmp_path / "legacy.db"
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    # Initialise with a fresh connect so schema + init run.
+    with kb.connect(db_path=db_path) as conn:
+        kb.create_task(conn, title="pre-migration-task")
+    # Simulate a re-entry through the init/migration path by discarding path cache.
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with kb.connect(db_path=db_path) as conn:
+        assert conn.execute("PRAGMA secure_delete").fetchone()[0] == 1
+        assert conn.execute("PRAGMA cell_size_check").fetchone()[0] == 1
+        assert conn.execute("PRAGMA synchronous").fetchone()[0] == 2
 
 # write_txn — rollback handler must not mask the original exception
 # ---------------------------------------------------------------------------

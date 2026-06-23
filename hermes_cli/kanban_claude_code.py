@@ -181,12 +181,21 @@ def _merge_profile_and_root_claude_code_config(
     root_raw: Mapping[str, Any],
 ) -> dict[str, Any]:
     profile = dict(profile_raw) if isinstance(profile_raw, Mapping) else {}
+    # Profile-local configs commonly carry schema defaults such as
+    # ``enabled: false`` and ``command: claude``.  Those values are not an
+    # operator override for the shared external lane; if root enables Claude
+    # Code and the profile leaves it disabled, keep the root wrapper/auth
+    # settings intact.  Only an explicitly enabled profile Claude Code block
+    # may override root fields or add profile-local lanes.
+    profile_enabled = bool(profile.get("enabled"))
+    effective_profile = profile if profile_enabled else {}
+
     merged = dict(root_raw)
-    merged.update(profile)
-    merged["enabled"] = bool(root_raw.get("enabled") or profile.get("enabled"))
+    merged.update(effective_profile)
+    merged["enabled"] = bool(root_raw.get("enabled") or profile_enabled)
     merged["assignees"] = _merge_assignees(
         root_raw.get("assignees"),
-        profile.get("assignees"),
+        effective_profile.get("assignees"),
     )
     return merged
 

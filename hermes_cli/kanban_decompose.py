@@ -44,6 +44,8 @@ from dataclasses import dataclass
 from typing import Optional
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_claude_code
+from hermes_cli import kanban_routing
 from hermes_cli import profiles as profiles_mod
 
 logger = logging.getLogger(__name__)
@@ -89,6 +91,11 @@ Rules:
     and the system will route to the default_assignee.
   - Each child task body is what a fresh worker will read with no other
     context — be specific about goal, approach, and acceptance criteria.
+  - Routing policy: routine offline implementation, repair, research, and
+    synthesis/fan-in should go to claude-code. Routine review, verification,
+    QA, and challenge should go to claude-review. Reserve codexworker only
+    for critical adversarial or safety/security review. Preserve explicit
+    human-specified assignees already present on the root task.
 
 When the task is genuinely a single unit of work (no useful decomposition),
 return:
@@ -118,6 +125,7 @@ Available profiles (assignees you may pick from):
 {roster}
 
 Default assignee (used when no profile fits a task): {default_assignee}
+{routing_policy}
 """
 
 
@@ -199,12 +207,12 @@ def _resolve_orchestrator_profile(cfg: dict) -> str:
 
 
 def _resolve_default_assignee(cfg: dict) -> str:
-    """Resolve which profile catches child tasks the orchestrator can't route."""
+    """Resolve which spawnable lane catches child tasks the orchestrator can't route."""
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     explicit = (kanban_cfg.get("default_assignee") or "").strip()
     if explicit:
         try:
-            if profiles_mod.profile_exists(explicit):
+            if profiles_mod.profile_exists(explicit) or kanban_claude_code.is_configured_lane(explicit):
                 return explicit
         except Exception:
             pass
@@ -214,12 +222,14 @@ def _resolve_default_assignee(cfg: dict) -> str:
         return "default"
 
 
-def _build_roster() -> tuple[list[dict], set[str]]:
+def _build_roster(config: Optional[dict] = None) -> tuple[list[dict], set[str]]:
     """Return (roster_for_prompt, valid_assignee_names).
 
     Each roster entry is ``{name, description, has_description}``. The
     valid-set is used after the LLM responds to rewrite invalid
-    assignees to the default fallback.
+    assignees to the default fallback. External spawn backends such as
+    Claude Code lanes are included so the decomposer can intentionally
+    route routine work there even though they are not Hermes profiles.
     """
     roster: list[dict] = []
     valid: set[str] = set()
@@ -227,7 +237,7 @@ def _build_roster() -> tuple[list[dict], set[str]]:
         all_profiles = profiles_mod.list_profiles()
     except Exception as exc:
         logger.warning("decompose: failed to list profiles: %s", exc)
-        return roster, valid
+        all_profiles = []
     for p in all_profiles:
         desc = (p.description or "").strip()
         roster.append({
@@ -236,6 +246,20 @@ def _build_roster() -> tuple[list[dict], set[str]]:
             "has_description": bool(desc),
         })
         valid.add(p.name)
+
+    try:
+        external_lanes = sorted(kanban_claude_code.configured_assignees())
+    except Exception:
+        external_lanes = []
+    for name in external_lanes:
+        if name in valid:
+            continue
+        roster.append({
+            "name": name,
+            "description": kanban_routing.external_lane_description(name, config),
+            "has_description": True,
+        })
+        valid.add(name)
     return roster, valid
 
 
@@ -252,20 +276,25 @@ def _format_roster(roster: list[dict]) -> str:
 def _normalize_assignee_choice(
     assignee: object,
     *,
+    title: str,
+    body: str,
     default_assignee: str,
     valid_names: set[str],
+    config: Optional[dict] = None,
 ) -> str:
     """Return a valid assignee, falling back to ``default_assignee``.
 
     Fan-out children and the single-task fallback should share the same
     routing guarantee: promoted work must not be left unassigned.
     """
-    if not isinstance(assignee, str) or not assignee.strip():
-        return default_assignee
-    chosen = assignee.strip()
-    if chosen not in valid_names:
-        return default_assignee
-    return chosen
+    return kanban_routing.normalize_generated_assignee(
+        assignee,
+        title=title,
+        body=body,
+        default_assignee=default_assignee,
+        valid_names=valid_names,
+        config=config,
+    )
 
 
 def decompose_task(
@@ -295,7 +324,7 @@ def decompose_task(
     default_assignee = _resolve_default_assignee(cfg)
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     auto_promote = bool(kanban_cfg.get("auto_promote_children", True))
-    roster, valid_names = _build_roster()
+    roster, valid_names = _build_roster(cfg)
 
     try:
         from agent.auxiliary_client import call_llm  # type: ignore
@@ -309,6 +338,7 @@ def decompose_task(
         body=_truncate(task.body or "(no body)", 4000),
         roster=_format_roster(roster),
         default_assignee=default_assignee,
+        routing_policy=kanban_routing.instructions(cfg),
     )
 
     try:
@@ -354,8 +384,11 @@ def decompose_task(
         if not task.assignee:
             assignee_val = _normalize_assignee_choice(
                 parsed.get("assignee"),
+                title=title_val or task.title or "",
+                body=body_val or task.body or "",
                 default_assignee=default_assignee,
                 valid_names=valid_names,
+                config=cfg,
             )
         if title_val is None and body_val is None:
             return DecomposeOutcome(
@@ -404,8 +437,11 @@ def decompose_task(
         assignee = entry.get("assignee")
         chosen = _normalize_assignee_choice(
             assignee,
+            title=title.strip(),
+            body=body.strip(),
             default_assignee=default_assignee,
             valid_names=valid_names,
+            config=cfg,
         )
         if (
             isinstance(assignee, str)

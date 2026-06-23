@@ -52,6 +52,23 @@ def test_run_slash_create_and_list(kanban_home):
     assert "alice" in out
 
 
+def test_run_slash_create_without_assignee_uses_collaboration_routing(kanban_home):
+    review = json.loads(kc.run_slash(
+        "create 'Review routine patch' --body 'normal verification' --json"
+    ))
+    research = json.loads(kc.run_slash(
+        "create 'Research implementation options' --body 'offline synthesis' --json"
+    ))
+    explicit = json.loads(kc.run_slash(
+        "create 'Review explicit' --assignee codexworker --json"
+    ))
+
+    assert review["assignee"] == "claude-review"
+    assert research["assignee"] == "claude-code"
+    assert explicit["assignee"] == "codexworker"
+
+
+
 def test_run_slash_create_worktree_path_and_branch(kanban_home, tmp_path):
     target = tmp_path / ".worktrees" / "t6-wire"
     target_arg = target.as_posix()
@@ -133,6 +150,72 @@ def test_run_slash_dispatch_dry_run_counts(kanban_home):
     kc.run_slash("create 'b' --assignee bob")
     out = kc.run_slash("dispatch --dry-run")
     assert "Spawned:" in out
+
+
+def test_run_slash_dispatch_dry_run_nonspawnable_would_annotate_without_comment(
+    kanban_home, monkeypatch
+):
+    from hermes_cli import kanban_claude_code
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: False)
+    monkeypatch.setattr(
+        kanban_claude_code,
+        "is_configured_lane",
+        lambda *_args, **_kwargs: False,
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="manual lane dry run",
+            assignee="missing-lane-for-cli-test",
+        )
+
+    out = kc.run_slash("dispatch --dry-run")
+
+    assert "Skipped (non-spawnable assignee" in out
+    assert "would annotate on real dispatch" in out
+    assert "card annotated" not in out
+    assert task_id in out
+    with kb.connect() as conn:
+        assert kb.list_comments(conn, task_id) == []
+        assert kb.get_task(conn, task_id).status == "ready"
+
+
+def test_run_slash_dispatch_real_nonspawnable_reports_card_annotated(
+    kanban_home, monkeypatch
+):
+    from hermes_cli import kanban_claude_code
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: False)
+    monkeypatch.setattr(
+        kanban_claude_code,
+        "is_configured_lane",
+        lambda *_args, **_kwargs: False,
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="manual lane real dispatch",
+            assignee="missing-lane-for-cli-test",
+        )
+
+    out = kc.run_slash("dispatch")
+
+    assert "Skipped (non-spawnable assignee" in out
+    assert "card annotated" in out
+    assert "would annotate on real dispatch" not in out
+    assert task_id in out
+    with kb.connect() as conn:
+        dispatcher_comments = [
+            c
+            for c in kb.list_comments(conn, task_id)
+            if c.author == "kanban-dispatcher"
+        ]
+        assert len(dispatcher_comments) == 1
+        assert "will not auto-spawn" in dispatcher_comments[0].body
+        assert kb.get_task(conn, task_id).status == "ready"
 
 
 def test_explicit_board_ignores_inherited_direct_db_env(kanban_home, tmp_path, monkeypatch):

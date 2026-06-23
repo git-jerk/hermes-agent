@@ -286,6 +286,98 @@ class TestWorkerSpawnEnv:
         expected_ws = fresh_home / "kanban" / "boards" / "spawntest" / "workspaces"
         assert env["HERMES_KANBAN_WORKSPACES_ROOT"] == str(expected_ws)
 
+    def test_default_spawn_does_not_pin_sqlite_db_for_postgres_board(
+        self,
+        fresh_home,
+        monkeypatch,
+        tmp_path,
+    ):
+        captured = {}
+
+        class FakeProc:
+            pid = 12345
+
+        def fake_popen(cmd, *args, **kwargs):
+            captured["env"] = kwargs.get("env", {})
+            return FakeProc()
+
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        monkeypatch.setenv("HERMES_KANBAN_POSTGRES_DSN", "postgresql://example.invalid/hermes")
+
+        meta = kb.create_board("pgspawn")
+        meta.pop("db_path", None)
+        meta.setdefault("kanban", {})["storage"] = {
+            "backend": "postgres",
+            "postgres_dsn_env": "HERMES_KANBAN_POSTGRES_DSN",
+            "postgres_schema": "kanban_pgspawn",
+        }
+        kb.board_metadata_path("pgspawn").write_text(
+            json.dumps(meta, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        inherited_stale_db = tmp_path / "stale-worker-pin.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(inherited_stale_db))
+
+        task = kb.Task(
+            id="t_pg",
+            title="worker test",
+            body=None,
+            assignee="teknium",
+            status="ready",
+            priority=0,
+            created_by="user",
+            created_at=0,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="scratch",
+            workspace_path=None,
+            claim_lock=None,
+            claim_expires=None,
+            tenant=None,
+        )
+
+        kb._default_spawn(task, str(fresh_home / "ws"), board="pgspawn")
+
+        env = captured["env"]
+        assert env["HERMES_KANBAN_BOARD"] == "pgspawn"
+        assert env["HERMES_KANBAN_TASK"] == "t_pg"
+        assert "HERMES_KANBAN_DB" not in env
+        expected_ws = fresh_home / "kanban" / "boards" / "pgspawn" / "workspaces"
+        assert env["HERMES_KANBAN_WORKSPACES_ROOT"] == str(expected_ws)
+
+    def test_default_board_spawn_keeps_legacy_paths(self, fresh_home, monkeypatch):
+        captured = {}
+
+        class FakeProc:
+            pid = 1
+
+        def fake_popen(cmd, *args, **kwargs):
+            captured["env"] = kwargs.get("env", {})
+            return FakeProc()
+
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        task = kb.Task(
+            id="t_def",
+            title="",
+            body=None,
+            assignee="teknium",
+            status="ready",
+            priority=0,
+            created_by=None,
+            created_at=0,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="scratch",
+            workspace_path=None,
+            claim_lock=None,
+            claim_expires=None,
+            tenant=None,
+        )
+        kb._default_spawn(task, str(fresh_home / "ws"), board=None)
+        env = captured["env"]
+        assert env["HERMES_KANBAN_BOARD"] == "default"
+        assert env["HERMES_KANBAN_DB"] == str(fresh_home / "kanban.db")
+
 
 # ---------------------------------------------------------------------------
 # CLI surface
