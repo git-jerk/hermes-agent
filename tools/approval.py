@@ -4787,6 +4787,7 @@ def check_all_command_guards(command: str, env_type: str,
     # correctly persist the pattern key and downgrade the tirith key to
     # session — the UI was stricter than the persistence layer.
     has_permanent_capable = any(not is_t for _, _, is_t in warnings)
+    has_tirith = any(is_tirith for _, _, is_tirith in warnings)
 
     # An explicitly selected plugin transport replaces every built-in prompt
     # surface (CLI/TUI/gateway/ACP). Detection, allowed scopes, persistence,

@@ -1166,6 +1166,132 @@ class TestApprovalTimeoutIsNotConsent:
             lambda: {"mode": "manual", "timeout": seconds},
         )
 
+    def test_gateway_approval_data_allows_permanent_without_tirith(self, monkeypatch):
+        """Gateway approval payloads must be built without the stale has_tirith NameError."""
+        from tools import approval as mod
+
+        self._force_short_timeout(monkeypatch, seconds=5)
+        monkeypatch.setattr(
+            "tools.tirith_security.check_command_security",
+            lambda command: {"action": "allow", "findings": [], "summary": ""},
+        )
+
+        notified = []
+
+        def _notify(data):
+            notified.append(data)
+            mod.resolve_gateway_approval(self.SESSION_KEY, "deny")
+
+        mod.register_gateway_notify(self.SESSION_KEY, _notify)
+
+        result = mod.check_all_command_guards("rm -rf .git", "local")
+
+        assert result["approved"] is False
+        assert len(notified) == 1
+        assert notified[0]["allow_permanent"] is True
+
+    def test_gateway_approval_data_hides_permanent_for_tirith_warning(self, monkeypatch):
+        """Remote UIs hide durable approval when the warning set includes Tirith."""
+        from tools import approval as mod
+
+        self._force_short_timeout(monkeypatch, seconds=5)
+        tirith_warn = {
+            "action": "warn",
+            "findings": [
+                {
+                    "rule_id": "test.rule",
+                    "severity": "medium",
+                    "title": "Test",
+                    "description": "test warning",
+                }
+            ],
+            "summary": "test warning",
+        }
+        monkeypatch.setattr("tools.tirith_security.check_command_security", lambda command: tirith_warn)
+
+        notified = []
+
+        def _notify(data):
+            notified.append(data)
+            mod.resolve_gateway_approval(self.SESSION_KEY, "session")
+
+        mod.register_gateway_notify(self.SESSION_KEY, _notify)
+
+        result = mod.check_all_command_guards("echo safe", "local")
+
+        assert result["approved"] is True
+        assert len(notified) == 1
+        assert notified[0]["pattern_keys"] == ["tirith:test.rule"]
+        assert notified[0]["allow_permanent"] is False
+
+    def test_manual_callback_receives_allow_permanent_without_tirith(self, monkeypatch):
+        """The CLI/manual branch still computes the warning set without gateway state."""
+        from tools import approval as mod
+
+        monkeypatch.setattr(mod, "_get_approval_config", lambda: {"mode": "manual", "timeout": 5})
+        monkeypatch.setattr(
+            "tools.tirith_security.check_command_security",
+            lambda command: {"action": "allow", "findings": [], "summary": ""},
+        )
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+
+        seen_allow_permanent = []
+
+        def _approval_callback(command, description, *, allow_permanent=True):
+            seen_allow_permanent.append(allow_permanent)
+            return "deny"
+
+        result = mod.check_all_command_guards(
+            "rm -rf .git",
+            "local",
+            approval_callback=_approval_callback,
+        )
+
+        assert result["approved"] is False
+        assert seen_allow_permanent == [True]
+
+    def test_manual_callback_receives_allow_permanent_for_tirith_exact_approval(self, monkeypatch):
+        """CLI/manual approvals may offer exact-command durable approval for Tirith findings."""
+        from tools import approval as mod
+
+        monkeypatch.setattr(mod, "_get_approval_config", lambda: {"mode": "manual", "timeout": 5})
+        tirith_warn = {
+            "action": "warn",
+            "findings": [
+                {
+                    "rule_id": "manual.rule",
+                    "severity": "medium",
+                    "title": "Manual Test",
+                    "description": "manual test warning",
+                }
+            ],
+            "summary": "manual test warning",
+        }
+        monkeypatch.setattr("tools.tirith_security.check_command_security", lambda command: tirith_warn)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+
+        seen_allow_permanent = []
+
+        def _approval_callback(command, description, *, allow_permanent=True):
+            seen_allow_permanent.append(allow_permanent)
+            return "deny"
+
+        result = mod.check_all_command_guards(
+            "echo safe",
+            "local",
+            approval_callback=_approval_callback,
+        )
+
+        assert result["approved"] is False
+        assert seen_allow_permanent == [True]
+
+    def test_timeout_returns_approved_false_with_no_consent(self, monkeypatch):
+        """The reported #24912 scenario — user never responds, agent must see BLOCKED."""
+
     def test_timeout_blocks_with_no_consent_and_timeout_hook(self, monkeypatch):
         """The reported #24912 scenario — user never responds, agent must see
         BLOCKED, and the post hook must distinguish timeout from deny so audit
