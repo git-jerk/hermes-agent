@@ -232,6 +232,55 @@ def agent_with_memory_tool():
         return a
 
 
+def _make_agent_with_compression_config(compression_cfg: dict) -> AIAgent:
+    cfg = {
+        "compression": compression_cfg,
+        "context": {"engine": "compressor"},
+        "memory": {"memory_enabled": False, "user_profile_enabled": False},
+        "model": {"context_length": 272_000},
+    }
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch(
+            "run_agent.get_tool_definitions",
+            return_value=_make_tool_defs("web_search"),
+        ),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        return AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://chatgpt.com/backend-api/codex",
+            provider="openai-codex",
+            model="gpt-5.5",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+
+def test_codex_gpt55_autoraise_does_not_lower_explicit_threshold():
+    agent = _make_agent_with_compression_config(
+        {"enabled": True, "threshold": 0.88, "codex_gpt55_autoraise": True}
+    )
+
+    compressor = getattr(agent, "context_compressor")
+    assert compressor.threshold_percent == 0.88
+    assert compressor.threshold_tokens == int(272_000 * 0.88)
+    assert getattr(agent, "_compression_threshold_autoraised") is None
+
+
+def test_codex_gpt55_autoraise_still_raises_low_default_threshold():
+    agent = _make_agent_with_compression_config(
+        {"enabled": True, "threshold": 0.50, "codex_gpt55_autoraise": True}
+    )
+
+    compressor = getattr(agent, "context_compressor")
+    assert compressor.threshold_percent == 0.85
+    assert compressor.threshold_tokens == int(272_000 * 0.85)
+    assert getattr(agent, "_compression_threshold_autoraised") == {"from": 0.50, "to": 0.85}
+
+
 def test_aiagent_reuses_existing_errors_log_handler():
     """Repeated AIAgent init should not accumulate duplicate errors.log handlers."""
     root_logger = logging.getLogger()
