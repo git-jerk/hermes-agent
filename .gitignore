@@ -205,3 +205,10 @@ native/fts5_cjk/*.so
 # interrupted; consumed by launch-time recovery. Never commit it (was tracked
 # by accident via 3a69e34702, removed in the #72002 salvage).
 .lazy-refresh-incomplete
+
+# Kanban runtime task artifacts: the dispatcher writes per-task scratch dirs,
+# evaluation outputs, and temp worktrees into the repo root. Throwaway runtime
+# state, never part of the repo — ignore so update's autostash skips them too.
+.kanban-t_*/
+kanban-artifacts/
+tmp-*-t_*/

@@ -171,9 +171,6 @@ def _explicit_board_scope(slug: str):
             yield
 
 
-def _check_dispatcher_presence() -> tuple[bool, str]:
-
-
 def _check_dispatcher_presence(
     hermes_home: Optional[Path] = None,
 ) -> tuple[bool, str]:
