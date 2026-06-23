@@ -246,6 +246,38 @@ class TestUnifiedCronjobTool:
         assert listing["jobs"][0]["name"] == "Server Check"
         assert listing["jobs"][0]["state"] == "scheduled"
 
+    def test_create_omitted_deliver_defaults_local_even_in_chat_origin(self, monkeypatch):
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "matrix")
+        monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "!room:example")
+
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Routine inventory",
+                schedule="every 1h",
+                name="Routine inventory",
+            )
+        )
+
+        assert created["success"] is True
+        assert created["deliver"] == "local"
+        listing = json.loads(cronjob(action="list"))
+        assert listing["jobs"][0]["deliver"] == "local"
+
+    def test_create_explicit_origin_delivery_preserved(self):
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Approved alert",
+                schedule="every 1h",
+                name="Approved alert",
+                deliver="origin",
+            )
+        )
+
+        assert created["success"] is True
+        assert created["deliver"] == "origin"
+
     def test_list_handles_partial_legacy_job_records(self):
         from cron.jobs import save_jobs
 

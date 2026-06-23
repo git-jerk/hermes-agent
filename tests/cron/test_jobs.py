@@ -253,9 +253,16 @@ class TestJobCRUD:
         assert load_jobs() == []
 
 
-    def test_default_delivery_origin(self, tmp_cron_dir):
+    def test_default_delivery_local_even_with_origin(self, tmp_cron_dir):
         job = create_job(
             prompt="Test", schedule="30m",
+            origin={"platform": "telegram", "chat_id": "123"},
+        )
+        assert job["deliver"] == "local"
+
+    def test_explicit_origin_delivery_preserved(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Test", schedule="30m", deliver="origin",
             origin={"platform": "telegram", "chat_id": "123"},
         )
         assert job["deliver"] == "origin"

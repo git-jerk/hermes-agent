@@ -71,6 +71,11 @@ class TestScheduleResolution:
     def test_defaults_fill_when_omitted(self):
         spec = fill_blueprint(get_blueprint("morning-brief"), {})
         assert spec["schedule"] == "0 8 * * *"
+        assert spec["deliver"] == "local"
+
+    def test_explicit_origin_deliver_preserved(self):
+        spec = fill_blueprint(get_blueprint("morning-brief"), {"deliver": "origin"})
+        assert spec["deliver"] == "origin"
 
 
 class TestValidation:

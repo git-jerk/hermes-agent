@@ -1139,7 +1139,7 @@ Per-job fields include `skills` (load specific skills), `model` /
 stdout is injected into the prompt; `no_agent=True` turns the script
 into the entire job), `context_from` (chain job A's last output into
 job B's prompt), `workdir` (run in a specific directory with its
-`AGENTS.md`/`CLAUDE.md` loaded), and multi-platform delivery.
+`AGENTS.md`/`CLAUDE.md` loaded), and multi-platform delivery. Delivery defaults to `local`; `origin`, `matrix`, `all`, and platform targets are explicit chat-delivery choices for user-requested reports/alerts, not routine stdout.
 
 Hardening invariants:
 - **3-minute hard interrupt** on cron sessions — runaway agent loops
@@ -1153,7 +1153,7 @@ Hardening invariants:
 
 Cron deliveries are **not** mirrored into the target gateway session —
 they land in their own cron session with a header/footer frame so the
-main conversation's message-role alternation stays intact.
+main conversation's message-role alternation stays intact. Use `python -m cron.scripts.check_delivery_policy` for a silent-on-pass local audit of active unallowlisted `origin`/Matrix delivery jobs.
 
 ---
 

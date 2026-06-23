@@ -1858,7 +1858,7 @@ def create_job(
         schedule: Schedule string (see parse_schedule)
         name: Optional friendly name
         repeat: How many times to run (None = forever, 1 = once)
-        deliver: Where to deliver output ("origin", "local", "telegram", etc.)
+        deliver: Where to deliver output ("local", "origin", "telegram", etc.). Omitted defaults to "local".
         origin: Source info where job was created (for "origin" delivery)
         skill: Optional legacy single skill name to load before running the prompt
         skills: Optional ordered list of skills to load before running the prompt
@@ -1929,9 +1929,10 @@ def create_job(
     if parsed_schedule["kind"] == "once" and repeat is None:
         repeat = 1
 
-    # Default delivery to origin if available, otherwise local
+    # Default delivery is local-only. Chat delivery (origin/platform targets)
+    # must be explicit so routine cron stdout does not ping Matrix/Home by accident.
     if deliver is None:
-        deliver = "origin" if origin else "local"
+        deliver = "local"
 
     job_id = uuid.uuid4().hex[:12]
     now = _hermes_now().isoformat()

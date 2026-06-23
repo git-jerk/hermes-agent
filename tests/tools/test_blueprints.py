@@ -73,14 +73,14 @@ class TestParseBlueprint:
         assert spec.prompt is not None and spec.prompt.startswith("Summarize")
 
 
-    def test_deliver_defaults_to_origin(self):
+    def test_deliver_defaults_to_local(self):
         skill = (
             "---\nname: r\ndescription: d\nmetadata:\n  hermes:\n"
             '    blueprint:\n      schedule: "every 1h"\n---\n\nbody'
         )
         spec = parse_blueprint(skill)
         assert spec is not None
-        assert spec.deliver == "origin"
+        assert spec.deliver == "local"
 
 
 class TestBlueprintSpecForInstalled:

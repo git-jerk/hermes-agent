@@ -57,7 +57,7 @@ CATALOG: List[CatalogEntry] = [
             ),
             "schedule": "0 8 * * *",
             "name": "Daily briefing",
-            "deliver": "origin",
+            "deliver": "local",
         },
     ),
     CatalogEntry(
@@ -81,7 +81,7 @@ CATALOG: List[CatalogEntry] = [
             ),
             "schedule": "every 30m",
             "name": "Important-mail monitor",
-            "deliver": "origin",
+            "deliver": "local",
         },
     ),
     CatalogEntry(
@@ -98,7 +98,7 @@ CATALOG: List[CatalogEntry] = [
             ),
             "schedule": "0 18 * * 0",
             "name": "Weekly review",
-            "deliver": "origin",
+            "deliver": "local",
         },
     ),
     CatalogEntry(
@@ -115,7 +115,7 @@ CATALOG: List[CatalogEntry] = [
             ),
             "schedule": "0 9 * * 1-5",
             "name": "Workday start reminder",
-            "deliver": "origin",
+            "deliver": "local",
         },
     ),
 ]

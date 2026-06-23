@@ -94,7 +94,7 @@ class AutomationBlueprint:
     # Seed instruction for the agent / the cron job prompt; may contain {slot}s.
     prompt_template: str
     slots: List[BlueprintSlot] = field(default_factory=list)
-    deliver_default: str = "origin"
+    deliver_default: str = "local"
     skills: tuple = ()        # skills the job loads before running
     tags: tuple = ()
 
@@ -109,10 +109,10 @@ _TIME = lambda default="08:00": BlueprintSlot(  # noqa: E731 - concise factory
 )
 _DELIVER = BlueprintSlot(
     name="deliver", type="enum", label="Where to deliver?",
-    default="origin", options=("origin", "local", "telegram", "discord", "email"),
+    default="local", options=("local", "origin", "telegram", "discord", "email"),
     optional=False, strict=False,
-    help="origin = the chat you set this up from (or your configured home "
-    "channel when created from the dashboard); local = save only, no message; "
+    help="local = save only, no message; origin = the chat you set this up "
+    "from (or your configured home channel when created from the dashboard); "
     "or any connected platform name",
 )
 

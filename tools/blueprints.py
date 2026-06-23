@@ -8,7 +8,7 @@ frontmatter:
       hermes:
         blueprint:
           schedule: "0 9 * * *"     # presence of `blueprint:` marks it runnable
-          deliver: origin            # optional (default "origin")
+          deliver: local             # optional (default "local")
           prompt: "..."              # optional task instruction for the run
           no_agent: false            # optional
 
@@ -60,7 +60,7 @@ class BlueprintSpec:
 
     skill_name: str
     schedule: str
-    deliver: str = "origin"
+    deliver: str = "local"
     prompt: Optional[str] = None
     no_agent: bool = False
     model: Optional[str] = None
@@ -117,7 +117,7 @@ def parse_blueprint(skill_md_text: str) -> Optional[BlueprintSpec]:
     if not schedule:
         raise BlueprintError("blueprint.schedule is required and must be non-empty")
 
-    deliver = str(blueprint.get("deliver", "origin")).strip() or "origin"
+    deliver = str(blueprint.get("deliver", "local")).strip() or "local"
     prompt = blueprint.get("prompt")
     if prompt is not None:
         prompt = str(prompt)
@@ -234,7 +234,7 @@ def register_blueprint_suggestion(spec: BlueprintSpec) -> Optional[Dict[str, Any
         title=f"Schedule '{spec.skill_name}'",
         description=(
             f"The '{spec.skill_name}' blueprint runs on schedule {spec.schedule}"
-            + (f", delivering to {spec.deliver}" if spec.deliver and spec.deliver != "origin" else "")
+            + (f", delivering to {spec.deliver}" if spec.deliver and spec.deliver != "local" else "")
             + "."
         ),
         source="blueprint",
@@ -262,7 +262,7 @@ def export_blueprint(job: Dict[str, Any], body: str, *, blueprint_name: Optional
 
     blueprint_block: Dict[str, Any] = {"schedule": schedule}
     deliver = job.get("deliver")
-    if deliver and deliver != "origin":
+    if deliver and deliver != "local":
         blueprint_block["deliver"] = deliver
     if job.get("prompt"):
         blueprint_block["prompt"] = job["prompt"]
