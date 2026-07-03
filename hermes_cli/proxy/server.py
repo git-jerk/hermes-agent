@@ -13,8 +13,24 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 from typing import Optional
+
+# aiohttp's default client_max_size is 1 MiB, which silently 413s any request
+# body over ~1 MB. Modern conversation payloads (base64 image attachments, large
+# tool schemas) routinely exceed that, and the upstream (Codex/OpenAI) accepts
+# far larger bodies — so the 1 MB cap is a purely local, artificial failure that
+# the agent misreads as "context too large" and burns 3 futile compression
+# retries on before resetting the session. Raise the ceiling generously; the
+# upstream still enforces its own real limit. Override via env if needed.
+_DEFAULT_MAX_BODY_BYTES = 100 * 1024 * 1024  # 100 MiB
+try:
+    PROXY_MAX_BODY_BYTES = int(
+        os.environ.get("HERMES_PROXY_MAX_BODY_BYTES", _DEFAULT_MAX_BODY_BYTES)
+    )
+except (TypeError, ValueError):
+    PROXY_MAX_BODY_BYTES = _DEFAULT_MAX_BODY_BYTES
 
 try:
     import aiohttp
@@ -92,7 +108,7 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
             "aiohttp is required for `hermes proxy`. Run `hermes setup` to install it."
         )
 
-    app = web.Application(client_max_size=MAX_REQUEST_BYTES)
+    app = web.Application(client_max_size=PROXY_MAX_BODY_BYTES)
     # AppKey ensures forward-compat with future aiohttp versions that strip
     # bare-string keys.
     _adapter_key = web.AppKey("adapter", UpstreamAdapter)
@@ -239,7 +255,13 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
             upstream_resp.release()
             await session.close()
 
-        await resp.write_eof()
+        try:
+            await resp.write_eof()
+        except (aiohttp.ClientError, ConnectionError, asyncio.CancelledError) as exc:
+            # Client (agent) already hung up — writing the terminating chunk to a
+            # closed transport is harmless. Log at debug instead of letting the
+            # aiohttp server log a full traceback to errors.log on every reset.
+            logger.debug("proxy: write_eof on closed transport: %s", exc)
         return resp
 
     # /health doesn't go through the upstream
