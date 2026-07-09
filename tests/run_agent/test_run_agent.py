@@ -278,7 +278,13 @@ def test_codex_gpt55_autoraise_still_raises_low_default_threshold():
     compressor = getattr(agent, "context_compressor")
     assert compressor.threshold_percent == 0.85
     assert compressor.threshold_tokens == int(272_000 * 0.85)
-    assert getattr(agent, "_compression_threshold_autoraised") == {"from": 0.50, "to": 0.85}
+    # Upstream's gpt-5.6 E2E work added a "model" slug to the notice dict;
+    # the guarantee under test is the from/to raise, so pin those keys and
+    # tolerate additional metadata.
+    notice = getattr(agent, "_compression_threshold_autoraised")
+    assert notice is not None
+    assert notice["from"] == 0.50
+    assert notice["to"] == 0.85
 
 
 def test_aiagent_reuses_existing_errors_log_handler():
