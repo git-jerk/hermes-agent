@@ -209,7 +209,17 @@ class SqliteBackend:
                 pass
             raise
         else:
-            _execute_boundary_with_retry(conn, "COMMIT")
+            try:
+                _execute_boundary_with_retry(conn, "COMMIT")
+            except Exception:
+                # COMMIT exhausted retries with the txn still open; roll back
+                # so the connection isn't poisoned for the next BEGIN
+                # IMMEDIATE (mirrors upstream kanban_db.write_txn).
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.OperationalError:
+                    pass
+                raise
             try:
                 from hermes_cli.kanban_db import _check_file_length_invariant
 
