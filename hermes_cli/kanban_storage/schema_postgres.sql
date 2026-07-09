@@ -50,7 +50,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     max_retries          BIGINT,
     goal_mode            BIGINT NOT NULL DEFAULT 0,
     goal_max_turns       BIGINT,
-    session_id           TEXT
+    session_id           TEXT,
+    project_id           TEXT,
+    block_kind           TEXT,
+    block_recurrences    BIGINT NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task_links (

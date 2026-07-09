@@ -102,6 +102,7 @@ _CANONICAL_COLUMNS: dict[str, list[str]] = {
         "current_run_id", "workflow_template_id", "current_step_key",
         "skills", "model_override", "max_retries",
         "goal_mode", "goal_max_turns", "session_id",
+        "project_id", "block_kind", "block_recurrences",
     ],
     "task_links": ["parent_id", "child_id"],
     "task_runs": [

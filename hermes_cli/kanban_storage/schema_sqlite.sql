@@ -43,7 +43,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     skills               TEXT,
     model_override       TEXT,
     max_retries          INTEGER,
-    session_id           TEXT
+    session_id           TEXT,
+    project_id           TEXT,
+    block_kind           TEXT,
+    block_recurrences    INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
