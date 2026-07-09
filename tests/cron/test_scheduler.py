@@ -1974,6 +1974,7 @@ class TestParallelTick:
              patch("cron.scheduler.get_due_jobs", return_value=jobs), \
              patch("cron.scheduler.advance_next_runs"), \
              patch("cron.scheduler.claim_job_for_fire", return_value=True), \
+             patch("cron.scheduler.claim_dispatch", return_value=True), \
              patch("cron.scheduler.run_job", side_effect=mock_run_job), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result", return_value=None), \
