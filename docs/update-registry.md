@@ -99,6 +99,7 @@ the `mistralai 2.4.6` worm on PyPI. Every direct dep is pinned to
 | Probe | Current | Status | Update method | Declared in |
 |---|---|---|---|---|
 | `py.openai` | 2.24.0 | 🔒 | frozen | `pyproject.toml` |
+| `py.certifi` | 2026.5.20 | 🔒 | frozen | `pyproject.toml` |
 | `py.python-dotenv` | 1.2.2 | 🔒 | frozen | `pyproject.toml` |
 | `py.fire` | 0.7.1 | 🔒 | frozen | `pyproject.toml` |
 | `py.httpx` | 0.28.1 | 🔒 | frozen | `pyproject.toml` |
@@ -115,10 +116,13 @@ the `mistralai 2.4.6` worm on PyPI. Every direct dep is pinned to
 | `py.Markdown` | 3.10.2 | 🔒 | frozen | `pyproject.toml` |
 | `py.psycopg` | 3.3.4 | 🔒 | frozen | `pyproject.toml` |
 | `py.PyJWT` | 2.13.0 | 🔒 | frozen | `pyproject.toml` |
+| `py.cryptography` | 46.0.7 | 🔒 | frozen | `pyproject.toml` |
 | `py.tzdata` | 2025.3 | 🔒 | frozen | `pyproject.toml` |
 | `py.psutil` | 7.2.2 | 🔒 | frozen | `pyproject.toml` |
+| `py.websockets` | 15.0.1 | 🔒 | frozen | `pyproject.toml` |
 | `py.pathspec` | 1.1.1 | 🔒 | frozen | `pyproject.toml` |
 | `py.Pillow` | 12.2.0 | 🔒 | frozen | `pyproject.toml` |
+| `py.concurrent-log-handler` | 0.9.29 | 🔒 | frozen | `pyproject.toml` |
 
 **Refresh command:**
 

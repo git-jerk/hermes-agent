@@ -358,6 +358,7 @@ def _register_builtin_probes() -> None:
     # name/description plus a fallback version for non-source installs.
     _CORE_DEPS = [
         ("openai", "2.24.0", "OpenAI SDK (provider= openai, openrouter, custom aggregators)"),
+        ("certifi", "2026.5.20", "Mozilla CA certificate bundle (TLS trust store)"),
         ("python-dotenv", "1.2.2", ".env file loader"),
         ("fire", "0.7.1", "Google Fire — CLI argument parser"),
         ("httpx", "0.28.1", "HTTP client (with SOCKS extras)"),
@@ -374,10 +375,13 @@ def _register_builtin_probes() -> None:
         ("Markdown", "3.10.2", "Markdown to HTML conversion for rich message delivery"),
         ("psycopg", "3.3.4", "PostgreSQL driver (binary+pool extras; Kanban Postgres backend)"),
         ("PyJWT", "2.13.0", "JWT signing (Skills Hub GitHub App; PYSEC-2026-175/177/178/179 fixes)"),
+        ("cryptography", "46.0.7", "X.509 / crypto primitives (PyJWT[crypto] backend, TLS)"),
         ("tzdata", "2025.3", "Windows IANA timezone data (Windows-only conditional)"),
         ("psutil", "7.2.2", "Cross-platform process management"),
+        ("websockets", "15.0.1", "WebSocket client/server (gateway + realtime transports)"),
         ("pathspec", "1.1.1", ".gitignore-aware file matching for desktop build stamps"),
         ("Pillow", "12.2.0", "Image resize recovery for oversized vision-tool images"),
+        ("concurrent-log-handler", "0.9.29", "Windows-safe rotating log handler (Windows-only conditional)"),
     ]
     _live_pins = _load_pyproject_core_pins()
     for pkg, snapshot_ver, desc in _CORE_DEPS:
