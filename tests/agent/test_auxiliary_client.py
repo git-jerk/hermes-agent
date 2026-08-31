@@ -3008,7 +3008,7 @@ class TestCodexAdapterReasoningTranslation:
     """
 
     @staticmethod
-    def _build_adapter():
+    def _build_adapter(model="gpt-5.3-codex"):
         """Build a _CodexCompletionsAdapter with a mocked responses.create()."""
         from agent.auxiliary_client import _CodexCompletionsAdapter
         from types import SimpleNamespace
@@ -3048,7 +3048,7 @@ class TestCodexAdapterReasoningTranslation:
 
         real_client = MagicMock()
         real_client.responses.create = _create
-        adapter = _CodexCompletionsAdapter(real_client, "gpt-5.3-codex")
+        adapter = _CodexCompletionsAdapter(real_client, model)
         return adapter, captured_kwargs
 
 
@@ -3086,6 +3086,34 @@ class TestCodexAdapterReasoningTranslation:
         )
         assert captured.get("reasoning") == {"effort": "medium", "summary": "auto"}
         assert captured.get("include") == ["reasoning.encrypted_content"]
+
+    @pytest.mark.parametrize(
+        "model,expected",
+        [
+            ("gpt-5.6-sol", "max"),
+            ("gpt-5.6-luna", "max"),
+            ("gpt-5.5", "xhigh"),
+            ("gpt-5.4", "xhigh"),
+        ],
+    )
+    def test_ultra_never_reaches_the_codex_wire(self, model, expected):
+        """``ultra`` is Hermes ladder vocabulary, not a Codex wire level.
+
+        The Codex Responses backend rejects it with HTTP 400 ``invalid_value``
+        ("Supported values are: 'none', 'minimal', 'low', 'medium', 'high',
+        'xhigh', and 'max'") — including for gpt-5.6-sol, whose model catalog
+        advertises an ``ultra`` reasoning level (that is the Codex *client*
+        tier: max reasoning plus the CLI's own task delegation). Live-verified
+        on this endpoint 2026-08-31. The aux adapter must therefore clamp it to
+        the model's real ceiling, exactly like the main transport does
+        (agent/transports/codex.py) — max on gpt-5.6, xhigh on legacy.
+        """
+        adapter, captured = self._build_adapter(model=model)
+        adapter.create(
+            messages=[{"role": "user", "content": "hi"}],
+            extra_body={"reasoning": {"effort": "ultra"}},
+        )
+        assert captured.get("reasoning") == {"effort": expected, "summary": "auto"}
 
 
 

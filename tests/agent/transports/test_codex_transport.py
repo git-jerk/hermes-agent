@@ -1119,6 +1119,75 @@ class TestCodexTransportTimeout:
 
 
 
+class TestCodexTransportCodexReasoningEffort:
+    """The Codex Responses path clamps Hermes ladder levels onto the wire.
+
+    The backend's effort enum is per-model and live-verified against
+    chatgpt.com/backend-api/codex/responses (2026-08-31):
+
+        ultra    -> HTTP 400 invalid_value on every slug, including
+                    gpt-5.6-sol, whose model catalog advertises an ``ultra``
+                    reasoning level ("Maximum reasoning with automatic task
+                    delegation"). That is the Codex *client* tier — max
+                    reasoning plus the CLI's own delegation — not a wire value.
+        max      -> HTTP 200 on gpt-5.6; HTTP 400 unsupported_value on gpt-5.5
+                    ("Supported values are: 'none', 'low', 'medium', 'high',
+                    and 'xhigh'").
+        minimal  -> HTTP 400 on both generations.
+
+    Letting any of those reach the wire 400s every request (#89503 class), so
+    pin the translation at the transport, not only at the vocabulary helper.
+    """
+
+    @pytest.fixture
+    def transport(self):
+        from agent.transports.codex import ResponsesApiTransport
+        return ResponsesApiTransport()
+
+    @pytest.mark.parametrize(
+        "model,expected",
+        [
+            ("gpt-5.6-sol", "max"),
+            ("gpt-5.6-terra", "max"),
+            ("gpt-5.6-luna", "max"),
+            ("gpt-5.6", "max"),
+            ("gpt-5.5", "xhigh"),
+            ("gpt-5.4", "xhigh"),
+        ],
+    )
+    def test_ultra_clamps_to_the_model_ceiling(self, transport, model, expected):
+        kw = transport.build_kwargs(
+            model=model,
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            reasoning_config={"effort": "ultra"},
+        )
+
+        assert kw["reasoning"]["effort"] == expected
+
+    def test_max_clamps_on_legacy_models(self, transport):
+        """``max`` is gpt-5.6-only; gpt-5.5 tops out at xhigh."""
+        kw = transport.build_kwargs(
+            model="gpt-5.5",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            reasoning_config={"effort": "max"},
+        )
+
+        assert kw["reasoning"]["effort"] == "xhigh"
+
+    def test_minimal_clamps_to_low(self, transport):
+        """``minimal`` is rejected by both generations."""
+        kw = transport.build_kwargs(
+            model="gpt-5.6-sol",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            reasoning_config={"effort": "minimal"},
+        )
+
+        assert kw["reasoning"]["effort"] == "low"
+
+
 class TestCodexTransportXaiReasoningEffort:
     @pytest.fixture
     def transport(self):
